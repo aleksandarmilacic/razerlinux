@@ -64,7 +64,7 @@ sudo dnf install hidapi-devel systemd-devel
 ### Building from Source
 
 ```bash
-git clone https://github.com/yourusername/razerlinux.git
+git clone https://github.com/aleksandarmilacic/razerlinux.git
 cd razerlinux
 cargo build --release
 ```
