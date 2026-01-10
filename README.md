@@ -3,7 +3,7 @@
 A userspace Razer mouse configuration tool for Linux. No kernel drivers required!
 
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)
-![License](https://img.shields.io/badge/license-MIT-blue)
+![License](https://img.shields.io/badge/license-GPLv3-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-green)
 
 ## Features
@@ -20,6 +20,17 @@ A userspace Razer mouse configuration tool for Linux. No kernel drivers required
 |--------|--------|
 | Razer Naga Trinity | ✅ Tested |
 | Other Razer Mice | 🔧 Planned |
+
+## Supported Linux Distributions
+
+RazerLinux is a userspace app (hidapi + udev) and should run on most modern Linux distros.
+
+| Distro | Status | Notes |
+|--------|--------|-------|
+| openSUSE Tumbleweed | ✅ Tested | Primary dev target |
+| Fedora | 🟡 Expected to work | Install `hidapi-devel` + `systemd-devel` |
+| Ubuntu/Debian | 🟡 Expected to work | Install `libhidapi-dev` + `libudev-dev` |
+| Arch/Manjaro | 🟡 Expected to work | Install `hidapi` + `systemd-libs` |
 
 ## Screenshots
 
@@ -185,7 +196,11 @@ sudo zypper install wayland-devel
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+GNU GPL v3.0 - see [LICENSE](LICENSE) for details.
+
+Copyright (c) 2026 Aleksandar Milacic
+
+Copyright (c) 2026 Aleksandar Milacic
 
 ## Acknowledgments
 

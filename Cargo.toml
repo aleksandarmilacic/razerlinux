@@ -3,8 +3,8 @@ name = "razerlinux"
 version = "0.1.0"
 edition = "2024"
 description = "Razer mouse configuration tool for Linux"
-authors = ["amilacic"]
-license = "MIT"
+authors = ["Aleksandar Milacic"]
+license = "GPL-3.0-only"
 
 [dependencies]
 # USB HID communication
