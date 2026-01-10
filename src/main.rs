@@ -1,69 +1,74 @@
 //! RazerLinux - Razer Mouse Configuration Tool
-//! 
+//!
 //! A userspace application for configuring Razer mice on Linux
 //! without requiring kernel drivers.
 
 mod device;
 mod profile;
 mod protocol;
+mod remap;
 
 use anyhow::Result;
 use profile::{Profile, ProfileManager};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
-use tracing::{info, error, warn};
+use std::time::Duration;
+use tracing::{error, info, warn};
 
 slint::include_modules!();
 
 fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
-    
+
     info!("RazerLinux starting...");
-    
+
     // Create the main window
     let main_window = MainWindow::new()?;
-    
+
     // Shared device state
     let device: Rc<RefCell<Option<device::RazerDevice>>> = Rc::new(RefCell::new(None));
-    
+
+    // Shared remapping state
+    let remapper: Rc<RefCell<Option<remap::Remapper>>> = Rc::new(RefCell::new(None));
+    let remap_mappings: Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>> =
+        Rc::new(RefCell::new(BTreeMap::new()));
+
     // Try to find and connect to device on startup
     connect_device(&main_window, &device);
-    
+
     // Setup callbacks
-    setup_callbacks(&main_window, device);
-    
+    setup_callbacks(&main_window, device, remapper, remap_mappings);
+
     // Run the GUI event loop
     info!("Starting GUI...");
     main_window.run()?;
-    
+
     info!("RazerLinux shutting down");
     Ok(())
 }
 
-fn connect_device(
-    window: &MainWindow, 
-    device: &Rc<RefCell<Option<device::RazerDevice>>>
-) {
+fn connect_device(window: &MainWindow, device: &Rc<RefCell<Option<device::RazerDevice>>>) {
     match device::find_naga_trinity() {
         Ok(Some(device_info)) => {
             info!("Found Razer Naga Trinity at {}", device_info.path);
-            
+
             match device::RazerDevice::open(&device_info.path) {
                 Ok(mut dev) => {
                     info!("Device opened successfully!");
-                    
+
                     // Update UI with device info
                     window.set_device_name(device_info.product.into());
                     window.set_device_connected(true);
                     window.set_status_message("Connected".into());
-                    
+
                     // Read firmware version
                     match dev.get_firmware_version() {
                         Ok(version) => window.set_firmware_version(version.into()),
                         Err(_) => window.set_firmware_version("-".into()),
                     }
-                    
+
                     // Read current DPI
                     match dev.get_dpi() {
                         Ok((dpi_x, dpi_y)) => {
@@ -75,7 +80,7 @@ fn connect_device(
                             warn!("Failed to read DPI: {}", e);
                         }
                     }
-                    
+
                     // Store device handle
                     *device.borrow_mut() = Some(dev);
                 }
@@ -99,15 +104,17 @@ fn connect_device(
 }
 
 fn setup_callbacks(
-    window: &MainWindow, 
-    device: Rc<RefCell<Option<device::RazerDevice>>>
+    window: &MainWindow,
+    device: Rc<RefCell<Option<device::RazerDevice>>>,
+    remapper: Rc<RefCell<Option<remap::Remapper>>>,
+    remap_mappings: Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
 ) {
     // Apply DPI callback
     let device_clone = device.clone();
     let window_weak = window.as_weak();
     window.on_apply_dpi(move |dpi_x, dpi_y| {
         info!("Setting DPI to {}x{}", dpi_x, dpi_y);
-        
+
         if let Some(ref mut dev) = *device_clone.borrow_mut() {
             match dev.set_dpi(dpi_x as u16, dpi_y as u16) {
                 Ok(()) => {
@@ -125,8 +132,8 @@ fn setup_callbacks(
             }
         }
     });
-    
-    // Refresh device callback  
+
+    // Refresh device callback
     let device_clone = device.clone();
     let window_weak = window.as_weak();
     window.on_refresh_device(move || {
@@ -136,13 +143,15 @@ fn setup_callbacks(
             *device_clone.borrow_mut() = None;
             win.set_device_connected(false);
             win.set_status_message("Scanning...".into());
-            
+
             // Try to reconnect
             connect_device_inner(&win, &device_clone);
         }
     });
-    
+
     // Save profile callback
+    let remap_mappings_clone = remap_mappings.clone();
+    let remapper_clone = remapper.clone();
     let window_weak = window.as_weak();
     window.on_save_profile(move |profile_name| {
         info!("Saving profile: {}", profile_name);
@@ -152,25 +161,49 @@ fn setup_callbacks(
                 win.set_status_message("Enter a profile name first".into());
                 return;
             }
-            
+
             let dpi_x = win.get_current_dpi_x() as u16;
             let dpi_y = win.get_current_dpi_y() as u16;
-            let profile = Profile::from_device_settings(&name, dpi_x, dpi_y);
-            
+            let mut profile = Profile::from_device_settings(&name, dpi_x, dpi_y);
+            profile.remap.enabled = win.get_remap_enabled();
+            profile.remap.mappings = remap_mappings_clone
+                .borrow()
+                .iter()
+                .map(|(s, t)| profile::RemapMapping {
+                    source: *s,
+                    target: t.base,
+                    ctrl: t.mods.ctrl,
+                    alt: t.mods.alt,
+                    shift: t.mods.shift,
+                    meta: t.mods.meta,
+                })
+                .collect();
+
+            // If remapping is currently active, store the detected/selected device if any.
+            if profile.remap.enabled {
+                profile.remap.source_device = None;
+            } else {
+                // If disabled, still keep existing source_device if user loaded a profile.
+            }
+
             match ProfileManager::new() {
-                Ok(manager) => {
-                    match manager.save_profile(&profile) {
-                        Ok(_) => win.set_status_message(format!("Profile '{}' saved!", name).into()),
-                        Err(e) => win.set_status_message(format!("Save error: {}", e).into()),
-                    }
-                }
+                Ok(manager) => match manager.save_profile(&profile) {
+                    Ok(_) => win.set_status_message(format!("Profile '{}' saved!", name).into()),
+                    Err(e) => win.set_status_message(format!("Save error: {}", e).into()),
+                },
                 Err(e) => win.set_status_message(format!("Error: {}", e).into()),
             }
+
+            // If remapping was on, ensure it stays on after save.
+            // (No-op; actual state lives in remapper.)
+            let _ = remapper_clone.borrow();
         }
     });
-    
+
     // Load profile callback
     let device_clone = device.clone();
+    let remap_mappings_clone = remap_mappings.clone();
+    let remapper_clone = remapper.clone();
     let window_weak = window.as_weak();
     window.on_load_profile(move |profile_name| {
         info!("Loading profile: {}", profile_name);
@@ -180,7 +213,7 @@ fn setup_callbacks(
                 win.set_status_message("Enter a profile name first".into());
                 return;
             }
-            
+
             match ProfileManager::new() {
                 Ok(manager) => {
                     match manager.load_profile(&name) {
@@ -188,14 +221,43 @@ fn setup_callbacks(
                             // Update UI with profile settings
                             win.set_current_dpi_x(profile.dpi.x as i32);
                             win.set_current_dpi_y(profile.dpi.y as i32);
-                            
+
                             // Apply to device if connected
                             if let Some(ref mut dev) = *device_clone.borrow_mut() {
                                 if let Err(e) = dev.set_dpi(profile.dpi.x, profile.dpi.y) {
                                     error!("Failed to apply profile DPI: {}", e);
                                 }
                             }
-                            
+
+                            // Load remap mappings into UI state
+                            {
+                                let mut map = remap_mappings_clone.borrow_mut();
+                                map.clear();
+                                for m in &profile.remap.mappings {
+                                    map.insert(
+                                        m.source,
+                                        remap::MappingTarget {
+                                            base: m.target,
+                                            mods: remap::Modifiers {
+                                                ctrl: m.ctrl,
+                                                alt: m.alt,
+                                                shift: m.shift,
+                                                meta: m.meta,
+                                            },
+                                        },
+                                    );
+                                }
+                            }
+                            win.set_remap_enabled(profile.remap.enabled);
+                            update_remap_summary(&win, &remap_mappings_clone.borrow());
+
+                            // Start/stop remapper to match profile
+                            if profile.remap.enabled {
+                                start_remapper(&win, &remapper_clone, &remap_mappings_clone);
+                            } else {
+                                stop_remapper(&remapper_clone);
+                            }
+
                             win.set_status_message(format!("Profile '{}' loaded!", name).into());
                         }
                         Err(e) => win.set_status_message(format!("Load error: {}", e).into()),
@@ -205,37 +267,258 @@ fn setup_callbacks(
             }
         }
     });
+
+    // Remap enable/disable
+    let window_weak = window.as_weak();
+    let remapper_clone = remapper.clone();
+    let remap_mappings_clone = remap_mappings.clone();
+    window.on_remap_set_enabled(move |enabled| {
+        if let Some(win) = window_weak.upgrade() {
+            if enabled {
+                start_remapper(&win, &remapper_clone, &remap_mappings_clone);
+            } else {
+                stop_remapper(&remapper_clone);
+                win.set_status_message("Remapping disabled".into());
+            }
+        }
+    });
+
+    // Learn next button/key code
+    let window_weak = window.as_weak();
+    window.on_remap_learn_source(move || {
+        let window_weak = window_weak.clone();
+        std::thread::spawn(move || {
+            let result = remap::capture_next_key_code(Duration::from_secs(5), None);
+            slint::invoke_from_event_loop(move || {
+                if let Some(win) = window_weak.upgrade() {
+                    match result {
+                        Ok(code) => {
+                            win.set_remap_source_code(code as i32);
+                            win.set_status_message(format!("Captured source code: {code}").into());
+                        }
+                        Err(e) => win.set_status_message(format!("Learn failed: {e}").into()),
+                    }
+                }
+            })
+            .ok();
+        });
+    });
+
+    // Update friendly target label
+    let window_weak = window.as_weak();
+    window.on_remap_update_target_label(move |code, ctrl, alt, shift, meta| {
+        if let Some(win) = window_weak.upgrade() {
+            let label = format_mapping_target(&remap::MappingTarget {
+                base: code as u16,
+                mods: remap::Modifiers {
+                    ctrl,
+                    alt,
+                    shift,
+                    meta,
+                },
+            });
+            win.set_remap_target_label(label.into());
+        }
+    });
+
+    // Add mapping
+    let window_weak = window.as_weak();
+    let remap_mappings_clone = remap_mappings.clone();
+    window.on_remap_add_mapping(move |source, target, ctrl, alt, shift, meta| {
+        if let Some(win) = window_weak.upgrade() {
+            let s = source as u16;
+            let t = target as u16;
+            remap_mappings_clone.borrow_mut().insert(
+                s,
+                remap::MappingTarget {
+                    base: t,
+                    mods: remap::Modifiers {
+                        ctrl,
+                        alt,
+                        shift,
+                        meta,
+                    },
+                },
+            );
+            update_remap_summary(&win, &remap_mappings_clone.borrow());
+            win.set_status_message(format!(
+                "Mapped {} -> {}",
+                s,
+                format_mapping_target(&remap::MappingTarget {
+                    base: t,
+                    mods: remap::Modifiers {
+                        ctrl,
+                        alt,
+                        shift,
+                        meta,
+                    },
+                })
+            )
+            .into());
+        }
+    });
+
+    // Clear mappings
+    let window_weak = window.as_weak();
+    let remap_mappings_clone = remap_mappings.clone();
+    window.on_remap_clear(move || {
+        if let Some(win) = window_weak.upgrade() {
+            remap_mappings_clone.borrow_mut().clear();
+            update_remap_summary(&win, &remap_mappings_clone.borrow());
+            win.set_status_message("Mappings cleared".into());
+        }
+    });
+}
+
+fn start_remapper(
+    win: &MainWindow,
+    remapper: &Rc<RefCell<Option<remap::Remapper>>>,
+    mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+) {
+    if remapper.borrow().is_some() {
+        win.set_status_message("Remapping already enabled".into());
+        return;
+    }
+
+    let config = remap::RemapConfig {
+        source_device: None,
+        mappings: mappings.borrow().clone(),
+    };
+
+    match remap::Remapper::start(config) {
+        Ok(r) => {
+            *remapper.borrow_mut() = Some(r);
+            win.set_status_message("Remapping enabled (virtual device active)".into());
+        }
+        Err(e) => {
+            win.set_remap_enabled(false);
+            win.set_status_message(format!("Remap start failed: {e}").into());
+        }
+    }
+}
+
+fn stop_remapper(remapper: &Rc<RefCell<Option<remap::Remapper>>>) {
+    if let Some(r) = remapper.borrow_mut().take() {
+        r.stop();
+    }
+}
+
+fn update_remap_summary(win: &MainWindow, mappings: &BTreeMap<u16, remap::MappingTarget>) {
+    if mappings.is_empty() {
+        win.set_remap_summary("No mappings".into());
+        return;
+    }
+
+    // Keep it short for the UI.
+    let mut parts: Vec<String> = mappings
+        .iter()
+        .take(6)
+        .map(|(s, t)| format!("{s}->{}", format_mapping_target(t)))
+        .collect();
+    if mappings.len() > 6 {
+        parts.push(format!("+{} more", mappings.len() - 6));
+    }
+    win.set_remap_summary(parts.join("  ").into());
+}
+
+fn format_mapping_target(t: &remap::MappingTarget) -> String {
+    let mut parts: Vec<&'static str> = Vec::new();
+    if t.mods.ctrl {
+        parts.push("Ctrl");
+    }
+    if t.mods.alt {
+        parts.push("Alt");
+    }
+    if t.mods.shift {
+        parts.push("Shift");
+    }
+    if t.mods.meta {
+        parts.push("Meta");
+    }
+
+    let base_name = key_name(t.base).unwrap_or_else(|| format!("KEY({})", t.base));
+    if parts.is_empty() {
+        base_name
+    } else {
+        format!("{}+{}", parts.join("+"), base_name)
+    }
+}
+
+fn key_name(code: u16) -> Option<String> {
+    // Common, user-friendly labels for typical keyboard codes
+    match code {
+        2..=11 => Some(format!("{}", code_to_digit(code)?)),
+        59 => Some("F1".into()),
+        60 => Some("F2".into()),
+        61 => Some("F3".into()),
+        62 => Some("F4".into()),
+        63 => Some("F5".into()),
+        64 => Some("F6".into()),
+        65 => Some("F7".into()),
+        66 => Some("F8".into()),
+        67 => Some("F9".into()),
+        68 => Some("F10".into()),
+        69 => Some("F11".into()),
+        70 => Some("F12".into()),
+        28 => Some("Enter".into()),
+        57 => Some("Space".into()),
+        103 => Some("Up".into()),
+        108 => Some("Down".into()),
+        105 => Some("Left".into()),
+        106 => Some("Right".into()),
+        272 => Some("BtnLeft".into()),
+        273 => Some("BtnRight".into()),
+        274 => Some("BtnMiddle".into()),
+        275 => Some("BtnSide".into()),
+        276 => Some("BtnExtra".into()),
+        277 => Some("BtnForward".into()),
+        278 => Some("BtnBack".into()),
+        279 => Some("BtnTask".into()),
+        _ => None,
+    }
+}
+
+fn code_to_digit(code: u16) -> Option<char> {
+    // KEY_1..KEY_0 are 2..11
+    match code {
+        2 => Some('1'),
+        3 => Some('2'),
+        4 => Some('3'),
+        5 => Some('4'),
+        6 => Some('5'),
+        7 => Some('6'),
+        8 => Some('7'),
+        9 => Some('8'),
+        10 => Some('9'),
+        11 => Some('0'),
+        _ => None,
+    }
 }
 
 // Helper function for use inside callbacks (can't use &MainWindow in closure)
-fn connect_device_inner(
-    window: &MainWindow,
-    device: &Rc<RefCell<Option<device::RazerDevice>>>
-) {
+fn connect_device_inner(window: &MainWindow, device: &Rc<RefCell<Option<device::RazerDevice>>>) {
     match device::find_naga_trinity() {
-        Ok(Some(device_info)) => {
-            match device::RazerDevice::open(&device_info.path) {
-                Ok(mut dev) => {
-                    window.set_device_name(device_info.product.into());
-                    window.set_device_connected(true);
-                    window.set_status_message("Connected".into());
-                    
-                    if let Ok(version) = dev.get_firmware_version() {
-                        window.set_firmware_version(version.into());
-                    }
-                    
-                    if let Ok((dpi_x, dpi_y)) = dev.get_dpi() {
-                        window.set_current_dpi_x(dpi_x as i32);
-                        window.set_current_dpi_y(dpi_y as i32);
-                    }
-                    
-                    *device.borrow_mut() = Some(dev);
+        Ok(Some(device_info)) => match device::RazerDevice::open(&device_info.path) {
+            Ok(mut dev) => {
+                window.set_device_name(device_info.product.into());
+                window.set_device_connected(true);
+                window.set_status_message("Connected".into());
+
+                if let Ok(version) = dev.get_firmware_version() {
+                    window.set_firmware_version(version.into());
                 }
-                Err(e) => {
-                    window.set_status_message(format!("Error: {}", e).into());
+
+                if let Ok((dpi_x, dpi_y)) = dev.get_dpi() {
+                    window.set_current_dpi_x(dpi_x as i32);
+                    window.set_current_dpi_y(dpi_y as i32);
                 }
+
+                *device.borrow_mut() = Some(dev);
             }
-        }
+            Err(e) => {
+                window.set_status_message(format!("Error: {}", e).into());
+            }
+        },
         Ok(None) => {
             window.set_device_name("No device found".into());
             window.set_device_connected(false);

@@ -1,7 +1,7 @@
 //! Razer USB HID Protocol implementation
-//! 
+//!
 //! Based on reverse-engineering from OpenRazer project.
-//! 
+//!
 //! Report Structure (90 bytes):
 //! - Byte 0: Status (0x00 = new command, 0x01 = busy, 0x02 = success, 0x03 = failure, 0x05 = not supported)
 //! - Byte 1: Transaction ID (0xFF for older devices, 0x3F for newer)
@@ -17,12 +17,12 @@
 use anyhow::{Result, anyhow};
 
 /// Variable storage types used by Razer devices
-pub const VARSTORE: u8 = 0x01;  // Store in device persistent memory
-pub const NOSTORE: u8 = 0x00;   // Don't store, temporary
+pub const VARSTORE: u8 = 0x01; // Store in device persistent memory
+pub const NOSTORE: u8 = 0x00; // Don't store, temporary
 
 /// Transaction IDs for different device types
-pub const TRANSACTION_ID_OLD: u8 = 0xFF;    // Older devices like Naga Trinity
-pub const TRANSACTION_ID_NEW: u8 = 0x3F;    // Newer Chroma devices  
+pub const TRANSACTION_ID_OLD: u8 = 0xFF; // Older devices like Naga Trinity
+pub const TRANSACTION_ID_NEW: u8 = 0x3F; // Newer Chroma devices  
 pub const TRANSACTION_ID_WIRELESS: u8 = 0x1F; // Wireless devices (newer)
 
 /// Command classes for Razer devices
@@ -42,7 +42,7 @@ pub enum Command {
     GetSerialNumber,
     GetPollingRate,
     SetPollingRate,
-    
+
     // Mouse commands
     GetDpi,
     SetDpi,
@@ -57,13 +57,13 @@ impl Command {
             Command::GetSerialNumber => (0x00, 0x82),
             Command::GetPollingRate => (0x00, 0x85),
             Command::SetPollingRate => (0x00, 0x05),
-            
+
             // Mouse commands (class 0x04)
             Command::GetDpi => (0x04, 0x85),
             Command::SetDpi => (0x04, 0x05),
         }
     }
-    
+
     /// Get the expected data size for this command
     /// This is crucial - must match what OpenRazer uses!
     pub fn data_size(&self) -> u8 {
@@ -72,7 +72,7 @@ impl Command {
             Command::GetSerialNumber => 0x16,    // Returns 22-byte serial
             Command::GetPollingRate => 0x01,     // Returns 1 byte
             Command::SetPollingRate => 0x01,
-            Command::GetDpi => 0x07,             // CRITICAL: must be 0x07 for DPI query
+            Command::GetDpi => 0x07, // CRITICAL: must be 0x07 for DPI query
             Command::SetDpi => 0x07,
         }
     }
@@ -83,19 +83,19 @@ impl Command {
 pub struct RazerReport {
     pub status: u8,
     pub transaction_id: u8,
-    pub remaining_packets: u16,  // Big-endian u16!
+    pub remaining_packets: u16, // Big-endian u16!
     pub protocol_type: u8,
     pub data_size: u8,
     pub command_class: u8,
     pub command_id: u8,
-    pub data: [u8; 80],          // Arguments
+    pub data: [u8; 80], // Arguments
 }
 
 impl RazerReport {
     /// Create a new report for a command
     pub fn new(command: Command) -> Self {
         let (class, id) = command.class_and_id();
-        
+
         Self {
             status: 0x00,              // New command
             transaction_id: 0xFF,      // Naga Trinity uses 0xFF for DPI/old-style commands
@@ -107,20 +107,20 @@ impl RazerReport {
             data: [0u8; 80],
         }
     }
-    
+
     /// Create a new report for a command with specific transaction ID
     pub fn new_with_transaction_id(command: Command, transaction_id: u8) -> Self {
         let mut report = Self::new(command);
         report.transaction_id = transaction_id;
         report
     }
-    
+
     /// Calculate CRC (XOR of bytes 2-87)
     fn calculate_crc(&self) -> u8 {
         let bytes = self.to_bytes_without_crc();
         bytes[2..88].iter().fold(0u8, |acc, &x| acc ^ x)
     }
-    
+
     /// Convert to bytes without CRC (for CRC calculation)
     fn to_bytes_without_crc(&self) -> [u8; 90] {
         let mut bytes = [0u8; 90];
@@ -136,20 +136,20 @@ impl RazerReport {
         bytes[8..88].copy_from_slice(&self.data);
         bytes
     }
-    
+
     /// Convert to bytes for sending
     pub fn to_bytes(&self) -> [u8; 90] {
         let mut bytes = self.to_bytes_without_crc();
-        bytes[88] = self.calculate_crc();  // CRC at byte 88
-        bytes[89] = 0x00;                  // Reserved at byte 89
+        bytes[88] = self.calculate_crc(); // CRC at byte 88
+        bytes[89] = 0x00; // Reserved at byte 89
         bytes
     }
-    
+
     /// Parse a response from bytes
     pub fn from_bytes(bytes: &[u8; 90]) -> Result<Self> {
         let mut data = [0u8; 80];
-        data.copy_from_slice(&bytes[8..88]);  // Arguments at bytes 8-87
-        
+        data.copy_from_slice(&bytes[8..88]); // Arguments at bytes 8-87
+
         let report = Self {
             status: bytes[0],
             transaction_id: bytes[1],
@@ -160,7 +160,7 @@ impl RazerReport {
             command_id: bytes[7],
             data,
         };
-        
+
         // Check status
         match report.status {
             0x02 => Ok(report), // Success
@@ -176,7 +176,7 @@ impl RazerReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_report_creation() {
         let report = RazerReport::new(Command::GetFirmwareVersion);
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(report.command_id, 0x81);
         assert_eq!(report.transaction_id, 0xFF);
     }
-    
+
     #[test]
     fn test_report_serialization() {
         let report = RazerReport::new(Command::GetDpi);

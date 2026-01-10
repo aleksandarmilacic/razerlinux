@@ -3803,6 +3803,7 @@ dependencies = [
  "dirs",
  "evdev",
  "hidapi",
+ "libc",
  "serde",
  "slint",
  "slint-build",

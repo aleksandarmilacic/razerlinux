@@ -12,6 +12,7 @@ hidapi = "2.6"
 
 # Input event handling & virtual input
 evdev = "0.12"
+libc = "0.2"
 
 # Device hotplug detection  
 udev = "0.9"

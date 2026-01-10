@@ -10,6 +10,18 @@ A complete end-to-end solution for configuring and mapping Razer mice on Linux s
 - Create and manage profiles
 - Persist settings across reboots
 
+### Current Status (Jan 2026)
+- Userspace HID working for Naga Trinity (DPI read/write, firmware)
+- Slint GUI shipped
+- TOML profiles stored under `~/.config/razerlinux/profiles/`
+- Software remapping via evdev/uinput implemented (key + Ctrl/Alt/Shift/Meta combos)
+
+### Next Up
+- Remap UX presets (numbers/F-keys/arrows), target capture, and per-panel defaults (2/7/12 buttons)
+- Auto-detect side panel / button count from evdev name/capabilities and prefill mappings
+- RGB lighting control
+- Packaging (RPM/DEB/AppImage) and tray/autostart
+
 ---
 
 ## Problem Statement
@@ -133,10 +145,10 @@ sudo udevadm trigger
 - **12-Button Grid:** MMO grid layout (total ~19 buttons)
 
 **Features to Support:**
-- [ ] DPI adjustment (100-16,000 in steps)
+- [x] DPI adjustment (100-16,000 in steps)
 - [ ] Polling rate (125/500/1000 Hz)
-- [ ] All button remapping
-- [ ] Side panel auto-detection
+- [x] Software button remapping (key + modifier combos via evdev/uinput)
+- [ ] Side panel auto-detection and per-panel defaults (2/7/12)
 - [ ] RGB scroll wheel + logo lighting
 - [ ] On-board profile storage (if supported)
 

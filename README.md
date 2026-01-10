@@ -11,6 +11,7 @@ A userspace Razer mouse configuration tool for Linux. No kernel drivers required
 - **Direct USB HID Communication** - Talks directly to your Razer mouse via hidapi, no kernel driver needed
 - **DPI Configuration** - Read and set DPI (100-16000) with independent X/Y axis control
 - **Profile Management** - Save and load configuration profiles to TOML files
+- **Button Remapping (Software)** - evdev grab + uinput virtual device with modifier combos (Ctrl/Alt/Shift/Meta)
 - **Modern GUI** - Clean Qt-like interface built with Slint
 - **Lightweight** - Pure Rust, minimal dependencies
 
@@ -43,6 +44,7 @@ RazerLinux is a userspace app (hidapi + udev) and should run on most modern Linu
 - Rust 1.70+ (install via [rustup](https://rustup.rs/))
 - libhidapi development files
 - udev (for device permissions)
+- uinput (kernel module + access to `/dev/uinput`) for software remapping
 
 #### openSUSE
 ```bash
@@ -99,6 +101,13 @@ Or after building:
 - Independent X and Y axis control
 - Quick preset buttons (400, 800, 1600, 3200, 6400)
 
+#### Button Remapping (Software)
+- Requires `/dev/uinput` access; ensure the uinput module is loaded.
+- Works for all mouse buttons (left/right/middle/side/extra) as sources and for key/button targets.
+- In the Remapping panel: disable remapping, click “🎯 Learn Button”, press the desired mouse button to capture source.
+- Set a target code (presets coming soon) and optional modifiers (Ctrl/Alt/Shift/Meta), then click Add.
+- Enable remapping to start the virtual device; mappings persist in profiles.
+
 #### Profile Management
 - Save current settings to named profiles
 - Load profiles to quickly switch configurations
@@ -119,6 +128,17 @@ linked = true
 
 polling_rate = 1000
 brightness = 255
+
+[remap]
+enabled = true
+
+[[remap.mappings]]
+source = 1          # mouse button code (e.g., side button)
+target = 2          # target key code (e.g., KEY_1)
+ctrl = false
+alt = false
+shift = false
+meta = false
 ```
 
 ## Architecture
@@ -129,7 +149,8 @@ razerlinux/
 │   ├── main.rs       # GUI application entry point
 │   ├── device.rs     # USB HID device communication
 │   ├── protocol.rs   # Razer USB protocol implementation
-│   └── profile.rs    # Profile save/load management
+│   ├── profile.rs    # Profile save/load management
+│   └── remap.rs      # evdev/uinput software remapper
 ├── ui/
 │   └── main.slint    # Slint GUI definition
 └── config/
@@ -150,7 +171,9 @@ RazerLinux implements the Razer USB HID protocol:
 - [x] DPI read/write
 - [x] Slint GUI
 - [x] Profile save/load
-- [ ] Button remapping (evdev/uinput)
+- [x] Button remapping (evdev/uinput) — basic key + modifier combos
+- [ ] Remap UX presets (numbers/F-keys/arrows), target capture, per-panel defaults (2/7/12 buttons)
+- [ ] Auto-detect side panel / button count from evdev and prefill mappings
 - [ ] RGB lighting control
 - [ ] More device support
 - [ ] System tray integration
@@ -197,8 +220,6 @@ sudo zypper install wayland-devel
 ## License
 
 GNU GPL v3.0 - see [LICENSE](LICENSE) for details.
-
-Copyright (c) 2026 Aleksandar Milacic
 
 Copyright (c) 2026 Aleksandar Milacic
 
