@@ -1,0 +1,276 @@
+// RazerLinux - Slint UI
+// Main window for Razer mouse configuration
+
+import { Button, VerticalBox, HorizontalBox, Slider, GroupBox, ComboBox, CheckBox, LineEdit, SpinBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "RazerLinux - Razer Mouse Configurator";
+    min-width: 600px;
+    min-height: 500px;
+    background: #1a1a2e;
+    
+    // Properties exposed to Rust
+    in-out property <string> device-name: "No device connected";
+    in-out property <string> firmware-version: "-";
+    in-out property <int> current-dpi-x: 800;
+    in-out property <int> current-dpi-y: 800;
+    in-out property <bool> device-connected: false;
+    in-out property <string> status-message: "Searching for device...";
+    
+    // Callbacks to Rust
+    callback apply-dpi(int, int);
+    callback refresh-device();
+    callback save-profile(string);
+    callback load-profile(string);
+    
+    VerticalLayout {
+        padding: 20px;
+        spacing: 15px;
+        
+        // Header
+        Text {
+            text: "🐍 RazerLinux";
+            font-size: 28px;
+            font-weight: 700;
+            color: #00ff00;
+            horizontal-alignment: center;
+        }
+        
+        // Device Info Section
+        GroupBox {
+            title: "Device Information";
+            
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { 
+                        text: "Device:"; 
+                        color: #aaaaaa;
+                        min-width: 100px;
+                    }
+                    Text { 
+                        text: device-name; 
+                        color: device-connected ? #00ff00 : #ff4444;
+                        font-weight: 600;
+                    }
+                }
+                
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { 
+                        text: "Firmware:"; 
+                        color: #aaaaaa;
+                        min-width: 100px;
+                    }
+                    Text { 
+                        text: firmware-version; 
+                        color: #ffffff;
+                    }
+                }
+                
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { 
+                        text: "Status:"; 
+                        color: #aaaaaa;
+                        min-width: 100px;
+                    }
+                    Text { 
+                        text: status-message; 
+                        color: #88ff88;
+                    }
+                }
+            }
+        }
+        
+        // DPI Settings Section  
+        GroupBox {
+            title: "DPI Settings";
+            
+            VerticalLayout {
+                padding: 10px;
+                spacing: 15px;
+                
+                // DPI X
+                VerticalLayout {
+                    spacing: 5px;
+                    HorizontalLayout {
+                        Text { 
+                            text: "DPI X:"; 
+                            color: #aaaaaa;
+                            min-width: 60px;
+                        }
+                        Text { 
+                            text: current-dpi-x; 
+                            color: #00ff00;
+                            font-weight: 600;
+                            min-width: 50px;
+                        }
+                    }
+                    dpi-x-slider := Slider {
+                        minimum: 100;
+                        maximum: 16000;
+                        value: current-dpi-x;
+                        enabled: device-connected;
+                        changed(value) => {
+                            current-dpi-x = round(value / 100) * 100;
+                        }
+                    }
+                }
+                
+                // DPI Y
+                VerticalLayout {
+                    spacing: 5px;
+                    HorizontalLayout {
+                        Text { 
+                            text: "DPI Y:"; 
+                            color: #aaaaaa;
+                            min-width: 60px;
+                        }
+                        Text { 
+                            text: current-dpi-y; 
+                            color: #00ff00;
+                            font-weight: 600;
+                            min-width: 50px;
+                        }
+                    }
+                    dpi-y-slider := Slider {
+                        minimum: 100;
+                        maximum: 16000;
+                        value: current-dpi-y;
+                        enabled: device-connected;
+                        changed(value) => {
+                            current-dpi-y = round(value / 100) * 100;
+                        }
+                    }
+                }
+                
+                // Link X/Y checkbox and Apply button
+                HorizontalLayout {
+                    spacing: 15px;
+                    alignment: center;
+                    
+                    link-checkbox := CheckBox {
+                        text: "Link X/Y";
+                        checked: true;
+                    }
+                    
+                    Button {
+                        text: "Apply DPI";
+                        enabled: device-connected;
+                        clicked => {
+                            apply-dpi(current-dpi-x, current-dpi-y);
+                        }
+                    }
+                }
+                
+                // DPI Presets
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: center;
+                    
+                    Button {
+                        text: "400";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 400;
+                            current-dpi-y = 400;
+                        }
+                    }
+                    Button {
+                        text: "800";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 800;
+                            current-dpi-y = 800;
+                        }
+                    }
+                    Button {
+                        text: "1600";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 1600;
+                            current-dpi-y = 1600;
+                        }
+                    }
+                    Button {
+                        text: "3200";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 3200;
+                            current-dpi-y = 3200;
+                        }
+                    }
+                    Button {
+                        text: "6400";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 6400;
+                            current-dpi-y = 6400;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Profile Section
+        GroupBox {
+            title: "Profiles";
+            
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 10px;
+                alignment: center;
+                
+                profile-name := LineEdit {
+                    placeholder-text: "Profile name";
+                    min-width: 150px;
+                }
+                
+                Button {
+                    text: "Save Profile";
+                    enabled: device-connected;
+                    clicked => {
+                        save-profile(profile-name.text);
+                    }
+                }
+                
+                Button {
+                    text: "Load Profile";
+                    clicked => {
+                        load-profile(profile-name.text);
+                    }
+                }
+            }
+        }
+        
+        // Spacer
+        Rectangle { 
+            vertical-stretch: 1;
+        }
+        
+        // Bottom toolbar
+        HorizontalLayout {
+            spacing: 10px;
+            alignment: center;
+            
+            Button {
+                text: "🔄 Refresh Device";
+                clicked => {
+                    refresh-device();
+                }
+            }
+        }
+        
+        // Footer
+        Text {
+            text: "RazerLinux v0.1.0 - Userspace Razer Configuration";
+            font-size: 10px;
+            color: #666666;
+            horizontal-alignment: center;
+        }
+    }
+}
