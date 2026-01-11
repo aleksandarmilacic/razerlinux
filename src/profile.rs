@@ -163,6 +163,18 @@ pub struct MacroAction {
     pub delay_ms: Option<u32>,
 }
 
+impl MacroAction {
+    /// Format as a display string for UI
+    pub fn to_display_string(&self) -> String {
+        match self.action_type {
+            MacroActionType::KeyPress => format!("↓ KEY_{}", self.key_code.unwrap_or(0)),
+            MacroActionType::KeyRelease => format!("↑ KEY_{}", self.key_code.unwrap_or(0)),
+            MacroActionType::Delay => format!("⏱ {}ms", self.delay_ms.unwrap_or(0)),
+            MacroActionType::MouseClick => format!("🖱 BTN_{}", self.key_code.unwrap_or(0)),
+        }
+    }
+}
+
 /// Type of macro action
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MacroActionType {

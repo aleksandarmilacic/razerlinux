@@ -36,7 +36,7 @@ component SideButton inherits Rectangle {
         Text {
             text: current-mapping != "" ? current-mapping : "—";
             font-size: 9px;
-            color: #888888;
+            color: #aaaaaa;
             horizontal-alignment: center;
             overflow: elide;
         }
@@ -47,6 +47,42 @@ component SideButton inherits Rectangle {
 component TargetButton inherits Button {
     in property <int> key-code;
     min-width: 40px;
+}
+
+// Custom styled button with proper padding for dark theme
+component StyledButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    callback clicked();
+    
+    height: 32px;
+    min-width: 60px;
+    border-radius: 6px;
+    background: !enabled ? #374151 : 
+                primary ? (ta.pressed ? #4338ca : ta.has-hover ? #4f46e5 : #6366f1) :
+                (ta.pressed ? #374151 : ta.has-hover ? #4b5563 : #3f3f46);
+    border-width: 1px;
+    border-color: primary ? #818cf8 : #525252;
+    
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        alignment: center;
+        
+        Text {
+            text: label;
+            color: enabled ? #ffffff : #6b7280;
+            font-size: 12px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
 }
 
 export component MainWindow inherits Window {
@@ -134,6 +170,11 @@ export component MainWindow inherits Window {
     in-out property <string> current-macro-name: "";
     in-out property <int> selected-macro-id: 0;
     in-out property <bool> macro-recording: false;
+    in-out property <int> selected-action-index: -1;  // -1 = none selected
+    
+    // Macro actions as array for selectability (format: "type:value" per item)
+    // Types: "press", "release", "delay"
+    in-out property <[string]> macro-actions-list: [];
     
     // Macro list for button assignment dropdown (format: "id1:name1,id2:name2,...")
     in-out property <string> available-macros: "";
@@ -162,6 +203,9 @@ export component MainWindow inherits Window {
     callback add-macro-keypress();
     callback add-macro-delay();
     callback test-macro();
+    callback record-captured-key(int, bool);  // Called from background thread with captured key
+    callback remove-macro-action(int);  // Remove action at index from recording
+    callback clear-macro-focus();  // Clear focus from input fields when recording
     
     // Helper function to get source code for selected button
     function get-selected-source-code() -> int {
@@ -185,6 +229,12 @@ export component MainWindow inherits Window {
         if (selected-side-button == -20) { return dpi-down-code; }    // DPI Down → F14
         if (selected-side-button == -21) { return dpi-up-code; }      // DPI Up → F13
         return 0;
+    }
+    
+    // Hidden focus helper to clear focus from input fields
+    focus-helper := FocusScope {
+        width: 0px;
+        height: 0px;
     }
     
     VerticalLayout {
@@ -446,7 +496,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: "DPI captured via hidraw";
                                     font-size: 7px;
-                                    color: #555555;
+                                    color: #9ca3af;
                                     horizontal-alignment: center;
                                 }
                                 
@@ -918,7 +968,7 @@ export component MainWindow inherits Window {
             }
             
             Tab {
-                title: "� Macros";
+                title: "🎬 Macros";
                 
                 HorizontalLayout {
                     padding: 20px;
@@ -926,57 +976,150 @@ export component MainWindow inherits Window {
                     
                     // Left side: Macro list
                     VerticalLayout {
-                        spacing: 10px;
-                        width: 250px;
+                        spacing: 12px;
+                        width: 280px;
                         
-                        Text {
-                            text: "Saved Macros";
-                            font-size: 16px;
-                            font-weight: 600;
-                            color: #ffffff;
+                        // Header with count
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: space-between;
+                            Text {
+                                text: "📁 Saved Macros";
+                                font-size: 16px;
+                                font-weight: 700;
+                                color: #ffffff;
+                            }
                         }
                         
+                        // Macro list container
                         Rectangle {
-                            background: #252540;
-                            border-radius: 8px;
+                            background: #1a1a2e;
+                            border-radius: 10px;
                             border-width: 1px;
                             border-color: #333355;
-                            min-height: 300px;
+                            min-height: 320px;
                             
-                            ScrollView {
-                                VerticalLayout {
-                                    padding: 10px;
-                                    spacing: 5px;
-                                    
-                                    // Placeholder for macro list - will be populated dynamically
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 8px;
+                                
+                                // Empty state or macro list
+                                if macro-list-text == "No macros defined" : VerticalLayout {
+                                    alignment: center;
+                                    spacing: 10px;
+                                    Rectangle { height: 40px; }
                                     Text {
-                                        text: macro-list-text;
-                                        color: macro-list-text == "No macros defined" ? #666666 : #ffffff;
-                                        font-size: 12px;
+                                        text: "📭";
+                                        font-size: 48px;
+                                        horizontal-alignment: center;
+                                    }
+                                    Text {
+                                        text: "No macros yet";
+                                        color: #9ca3af;
+                                        font-size: 14px;
+                                        horizontal-alignment: center;
+                                    }
+                                    Text {
+                                        text: "Create your first macro\nto automate key sequences";
+                                        color: #d1d5db;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                                
+                                if macro-list-text != "No macros defined" : ScrollView {
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: macro-list-text;
+                                            color: #aaaaaa;
+                                            font-size: 12px;
+                                        }
                                     }
                                 }
                             }
                         }
                         
+                        // Action buttons
                         HorizontalLayout {
-                            spacing: 10px;
-                            alignment: center;
+                            spacing: 6px;
+                            alignment: stretch;
                             
-                            Button {
-                                text: "➕ New";
-                                clicked => { new-macro(); }
+                            Rectangle {
+                                background: new-macro-ta.has-hover ? #16a34a : #22c55e;
+                                border-radius: 6px;
+                                height: 34px;
+                                horizontal-stretch: 1;
+                                
+                                new-macro-ta := TouchArea {
+                                    clicked => { new-macro(); }
+                                }
+                                
+                                HorizontalLayout {
+                                    alignment: center;
+                                    padding: 8px;
+                                    Text {
+                                        text: "+ New";
+                                        color: #ffffff;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
-                            Button {
-                                text: "✏️ Edit";
-                                enabled: selected-macro-id > 0;
-                                clicked => { edit-macro(selected-macro-id); }
+                            
+                            Rectangle {
+                                background: selected-macro-id > 0 ? 
+                                    (edit-macro-ta.has-hover ? #2563eb : #3b82f6) : #374151;
+                                border-radius: 6px;
+                                height: 34px;
+                                horizontal-stretch: 1;
+                                
+                                edit-macro-ta := TouchArea {
+                                    enabled: selected-macro-id > 0;
+                                    clicked => { edit-macro(selected-macro-id); }
+                                }
+                                
+                                HorizontalLayout {
+                                    alignment: center;
+                                    padding: 8px;
+                                    Text {
+                                        text: "Edit";
+                                        color: selected-macro-id > 0 ? #ffffff : #6b7280;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
-                            Button {
-                                text: "🗑️ Delete";
-                                enabled: selected-macro-id > 0;
-                                clicked => { delete-macro(selected-macro-id); }
+                            
+                            Rectangle {
+                                background: selected-macro-id > 0 ? 
+                                    (delete-macro-ta.has-hover ? #dc2626 : #ef4444) : #374151;
+                                border-radius: 6px;
+                                height: 34px;
+                                horizontal-stretch: 1;
+                                
+                                delete-macro-ta := TouchArea {
+                                    enabled: selected-macro-id > 0;
+                                    clicked => { delete-macro(selected-macro-id); }
+                                }
+                                
+                                HorizontalLayout {
+                                    alignment: center;
+                                    padding: 8px;
+                                    Text {
+                                        text: "Delete";
+                                        color: selected-macro-id > 0 ? #ffffff : #6b7280;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
                         }
+                        
+                        Rectangle { vertical-stretch: 1; }
                     }
                     
                     // Right side: Macro editor
@@ -984,118 +1127,401 @@ export component MainWindow inherits Window {
                         spacing: 15px;
                         horizontal-stretch: 1;
                         
-                        Text {
-                            text: "Macro Editor";
-                            font-size: 16px;
-                            font-weight: 600;
-                            color: #ffffff;
-                        }
-                        
-                        GroupBox {
-                            title: "Macro Details";
+                        // Recording indicator banner
+                        if macro-recording : Rectangle {
+                            background: #ff2222;
+                            border-radius: 8px;
+                            height: 50px;
                             
-                            VerticalLayout {
-                                padding: 15px;
-                                spacing: 10px;
+                            HorizontalLayout {
+                                padding-left: 15px;
+                                padding-right: 15px;
+                                spacing: 12px;
+                                alignment: space-between;
                                 
                                 HorizontalLayout {
                                     spacing: 10px;
-                                    Text { text: "Name:"; color: #aaaaaa; min-width: 80px; vertical-alignment: center; }
-                                    macro-name-edit := LineEdit {
-                                        placeholder-text: "Enter macro name";
-                                        text: current-macro-name;
-                                        min-width: 200px;
+                                    alignment: start;
+                                    
+                                    Text {
+                                        text: "⏺";
+                                        color: #ffffff;
+                                        font-size: 24px;
+                                        vertical-alignment: center;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Text {
+                                            text: "RECORDING";
+                                            color: #ffffff;
+                                            font-weight: 700;
+                                            font-size: 14px;
+                                        }
+                                        Text {
+                                            text: "Type on your keyboard - keys captured automatically!";
+                                            color: #ffcccc;
+                                            font-size: 11px;
+                                        }
                                     }
                                 }
                                 
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    Text { text: "Repeat:"; color: #aaaaaa; min-width: 80px; vertical-alignment: center; }
-                                    macro-repeat := SpinBox {
-                                        minimum: 0;
-                                        maximum: 100;
-                                        value: 1;
+                                Rectangle {
+                                    background: #ffffff;
+                                    border-radius: 4px;
+                                    width: 80px;
+                                    height: 32px;
+                                    
+                                    stop-rec-ta := TouchArea {
+                                        clicked => { stop-macro-recording(); }
                                     }
-                                    Text { text: "(0 = while held)"; color: #666666; font-size: 11px; vertical-alignment: center; }
+                                    
+                                    Text {
+                                        text: "⏹ Stop";
+                                        color: #ff2222;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
                                 }
                             }
                         }
                         
-                        GroupBox {
-                            title: "Actions";
+                        // Editor header
+                        if !macro-recording : HorizontalLayout {
+                            spacing: 10px;
+                            alignment: space-between;
+                            
+                            Text {
+                                text: "✨ Macro Editor";
+                                font-size: 16px;
+                                font-weight: 700;
+                                color: #ffffff;
+                            }
+                        }
+                        
+                        // Name and settings
+                        Rectangle {
+                            background: #1f2937;
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: #374151;
                             
                             VerticalLayout {
-                                padding: 15px;
-                                spacing: 10px;
+                                padding: 16px;
+                                spacing: 12px;
                                 
-                                Rectangle {
-                                    background: #1a1a2e;
-                                    border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: #333355;
-                                    min-height: 150px;
+                                HorizontalLayout {
+                                    spacing: 12px;
                                     
-                                    ScrollView {
-                                        VerticalLayout {
-                                            padding: 10px;
-                                            spacing: 3px;
-                                            
-                                            Text {
-                                                text: macro-actions-text;
-                                                color: macro-actions-text == "No actions" ? #666666 : #00ff00;
-                                                font-size: 11px;
-                                                font-family: "monospace";
+                                    VerticalLayout {
+                                        horizontal-stretch: 2;
+                                        spacing: 4px;
+                                        Text { text: "Macro Name"; color: #9ca3af; font-size: 11px; font-weight: 600; }
+                                        macro-name-edit := LineEdit {
+                                            placeholder-text: "e.g., Quick Save, Double Click...";
+                                            text: current-macro-name;
+                                        }
+                                    }
+                                    
+                                    VerticalLayout {
+                                        width: 120px;
+                                        spacing: 4px;
+                                        Text { text: "Repeat Count"; color: #9ca3af; font-size: 11px; font-weight: 600; }
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            macro-repeat := SpinBox {
+                                                minimum: 0;
+                                                maximum: 100;
+                                                value: 1;
+                                            }
+                                            Text { 
+                                                text: macro-repeat.value == 0 ? "∞" : "";
+                                                color: #fbbf24;
+                                                font-size: 16px;
+                                                vertical-alignment: center;
                                             }
                                         }
                                     }
                                 }
                                 
+                                Text {
+                                    text: macro-repeat.value == 0 ? "⚡ Macro will repeat while button is held" : 
+                                          macro-repeat.value == 1 ? "▶ Macro will play once per press" :
+                                          "🔁 Macro will repeat " + macro-repeat.value + " times per press";
+                                    color: #9ca3af;
+                                    font-size: 11px;
+                                }
+                            }
+                        }
+                        
+                        // Actions section
+                        Rectangle {
+                            background: #1f2937;
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: macro-recording ? #ff4444 : #374151;
+                            vertical-stretch: 1;
+                            
+                            VerticalLayout {
+                                padding: 16px;
+                                spacing: 12px;
+                                
                                 HorizontalLayout {
-                                    spacing: 10px;
-                                    alignment: center;
+                                    spacing: 8px;
+                                    alignment: space-between;
                                     
-                                    Button {
-                                        text: "🔴 Record";
-                                        clicked => { start-macro-recording(); }
+                                    Text { 
+                                        text: "📋 Recorded Actions"; 
+                                        color: #ffffff; 
+                                        font-weight: 600; 
                                     }
-                                    Button {
-                                        text: "⏹️ Stop";
-                                        clicked => { stop-macro-recording(); }
-                                    }
-                                    Button {
-                                        text: "➕ Add Key";
-                                        clicked => { add-macro-keypress(); }
-                                    }
-                                    Button {
-                                        text: "⏱️ Add Delay";
-                                        clicked => { add-macro-delay(); }
+                                    
+                                    if !macro-recording : HorizontalLayout {
+                                        spacing: 6px;
+                                        
+                                        Rectangle {
+                                            background: #ef4444;
+                                            border-radius: 4px;
+                                            height: 28px;
+                                            width: 90px;
+                                            
+                                            start-rec-ta := TouchArea {
+                                                clicked => { 
+                                                    // Clear focus from LineEdit before starting
+                                                    focus-helper.focus();
+                                                    start-macro-recording(); 
+                                                }
+                                            }
+                                            
+                                            Text {
+                                                text: "⏺ Record";
+                                                color: #ffffff;
+                                                font-size: 11px;
+                                                font-weight: 600;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
                                     }
                                 }
                                 
+                                // Actions display - selectable items
+                                Rectangle {
+                                    background: #111827;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: macro-recording ? #ff6666 : #1f2937;
+                                    vertical-stretch: 1;
+                                    min-height: 120px;
+                                    
+                                    if macro-actions-list.length == 0 : VerticalLayout {
+                                        alignment: center;
+                                        Text {
+                                            text: macro-recording ? "🎯 Press keys to record..." : "No actions";
+                                            color: macro-recording ? #fbbf24 : #6b7280;
+                                            font-size: 12px;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                    
+                                    if macro-actions-list.length > 0 : ScrollView {
+                                        VerticalLayout {
+                                            padding: 8px;
+                                            spacing: 4px;
+                                            
+                                            for action[idx] in macro-actions-list : Rectangle {
+                                                background: idx == selected-action-index ? #374151 : 
+                                                            action-item-ta.has-hover ? #1f2937 : transparent;
+                                                border-radius: 4px;
+                                                border-width: idx == selected-action-index ? 1px : 0px;
+                                                border-color: #60a5fa;
+                                                height: 32px;
+                                                
+                                                HorizontalLayout {
+                                                    padding-left: 10px;
+                                                    padding-right: 6px;
+                                                    spacing: 8px;
+                                                    
+                                                    // Action text with touch area for selection
+                                                    Rectangle {
+                                                        horizontal-stretch: 1;
+                                                        
+                                                        action-item-ta := TouchArea {
+                                                            clicked => {
+                                                                selected-action-index = idx == selected-action-index ? -1 : idx;
+                                                            }
+                                                        }
+                                                        
+                                                        HorizontalLayout {
+                                                            Text {
+                                                                text: action;
+                                                                color: macro-recording ? #fbbf24 : #10b981;
+                                                                font-size: 12px;
+                                                                font-family: "monospace";
+                                                                vertical-alignment: center;
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    // Delete button - always visible when selected
+                                                    if idx == selected-action-index : Rectangle {
+                                                        background: del-action-ta.has-hover ? #dc2626 : #ef4444;
+                                                        border-radius: 4px;
+                                                        width: 24px;
+                                                        height: 24px;
+                                                        
+                                                        del-action-ta := TouchArea {
+                                                            clicked => {
+                                                                remove-macro-action(idx);
+                                                                selected-action-index = -1;
+                                                            }
+                                                        }
+                                                        
+                                                        Text {
+                                                            text: "✕";
+                                                            color: #ffffff;
+                                                            font-size: 14px;
+                                                            font-weight: 700;
+                                                            horizontal-alignment: center;
+                                                            vertical-alignment: center;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Action buttons
                                 HorizontalLayout {
-                                    spacing: 10px;
+                                    spacing: 8px;
                                     alignment: center;
                                     
-                                    Button {
-                                        text: "▶️ Test Macro";
-                                        clicked => { test-macro(); }
+                                    if macro-recording : Rectangle {
+                                        background: #22c55e;
+                                        border-radius: 6px;
+                                        height: 38px;
+                                        horizontal-stretch: 1;
+                                        
+                                        HorizontalLayout {
+                                            alignment: center;
+                                            spacing: 6px;
+                                            Text {
+                                                text: "🎤 Listening...";
+                                                color: #ffffff;
+                                                font-weight: 600;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                            }
+                                        }
                                     }
-                                    Button {
-                                        text: "💾 Save Macro";
-                                        clicked => { save-macro(macro-name-edit.text, macro-repeat.value); }
+                                    
+                                    Rectangle {
+                                        background: macro-recording ? #8b5cf6 : #374151;
+                                        border-radius: 6px;
+                                        height: 38px;
+                                        horizontal-stretch: 1;
+                                        
+                                        add-delay-ta := TouchArea {
+                                            enabled: macro-recording;
+                                            clicked => { add-macro-delay(); }
+                                        }
+                                        
+                                        HorizontalLayout {
+                                            alignment: center;
+                                            spacing: 6px;
+                                            Text {
+                                                text: "⏱️ Add Delay";
+                                                color: macro-recording ? #ffffff : #6b7280;
+                                                font-weight: 600;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                         
-                        Text {
-                            text: "💡 Tip: Assign macros to buttons in the Button Mapping tab";
-                            font-size: 11px;
-                            color: #666666;
-                            horizontal-alignment: center;
+                        // Bottom action bar
+                        HorizontalLayout {
+                            spacing: 12px;
+                            alignment: center;
+                            
+                            Rectangle {
+                                background: selected-macro-id > 0 ? #6366f1 : #374151;
+                                border-radius: 8px;
+                                height: 44px;
+                                width: 140px;
+                                
+                                test-ta := TouchArea {
+                                    enabled: selected-macro-id > 0;
+                                    clicked => { test-macro(); }
+                                }
+                                
+                                HorizontalLayout {
+                                    alignment: center;
+                                    spacing: 8px;
+                                    Text {
+                                        text: "▶️ Test";
+                                        color: selected-macro-id > 0 ? #ffffff : #6b7280;
+                                        font-weight: 700;
+                                        font-size: 14px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            
+                            Rectangle {
+                                background: macro-name-edit.text != "" ? #10b981 : #374151;
+                                border-radius: 8px;
+                                height: 44px;
+                                horizontal-stretch: 1;
+                                
+                                save-ta := TouchArea {
+                                    enabled: macro-name-edit.text != "";
+                                    clicked => { save-macro(macro-name-edit.text, macro-repeat.value); }
+                                }
+                                
+                                HorizontalLayout {
+                                    alignment: center;
+                                    spacing: 8px;
+                                    Text {
+                                        text: "💾 Save Macro";
+                                        color: macro-name-edit.text != "" ? #ffffff : #6b7280;
+                                        font-weight: 700;
+                                        font-size: 14px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
                         }
                         
-                        Rectangle { vertical-stretch: 1; }
+                        // Help tip
+                        Rectangle {
+                            background: #1e3a5f;
+                            border-radius: 6px;
+                            height: 36px;
+                            
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 8px;
+                                alignment: start;
+                                
+                                Text {
+                                    text: "💡";
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "After saving, assign macros to buttons in the Button Mapping tab";
+                                    font-size: 11px;
+                                    color: #93c5fd;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1143,7 +1569,7 @@ export component MainWindow inherits Window {
                             Text {
                                 text: "Profiles are saved to ~/.config/razerlinux/profiles/";
                                 font-size: 11px;
-                                color: #666666;
+                                color: #9ca3af;
                                 horizontal-alignment: center;
                             }
                         }
@@ -1158,7 +1584,7 @@ export component MainWindow inherits Window {
         Text {
             text: "RazerLinux v0.1.0 • GPL-3.0-only";
             font-size: 10px;
-            color: #555555;
+            color: #9ca3af;
             horizontal-alignment: center;
         }
     }

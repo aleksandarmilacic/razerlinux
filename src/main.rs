@@ -563,7 +563,12 @@ fn setup_callbacks(
             if let Some(m) = mgr.get_macro(macro_id as u32) {
                 win.set_selected_macro_id(macro_id);
                 win.set_current_macro_name(m.name.clone().into());
-                win.set_macro_actions_text(m.to_display_text().into());
+                // Populate actions list for editing
+                let actions: Vec<slint::SharedString> = m.actions.iter()
+                    .map(|a| a.to_display_string().into())
+                    .collect();
+                win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
+                win.set_selected_action_index(-1);
                 win.set_status_message(format!("Editing macro '{}'", m.name).into());
             } else {
                 win.set_status_message(format!("Macro {} not found", macro_id).into());
@@ -621,36 +626,68 @@ fn setup_callbacks(
         }
     });
     
+    // Persistent key capture listener (stored in Rc for sharing)
+    let key_listener: Rc<RefCell<Option<remap::KeyCaptureListener>>> = Rc::new(RefCell::new(None));
+    
     let window_weak = window.as_weak();
     let macro_mgr = macro_manager.clone();
+    let key_listener_ref = key_listener.clone();
     window.on_start_macro_recording(move || {
         if let Some(win) = window_weak.upgrade() {
             let mut mgr = macro_mgr.borrow_mut();
             let name = win.get_current_macro_name().to_string();
             let macro_name = if name.is_empty() { "Untitled" } else { &name };
             
-            mgr.start_recording(macro_name);
-            win.set_macro_recording(true);
-            win.set_status_message("Recording macro... press keys in another window".into());
-            win.set_macro_actions_text("Recording in progress...\nPress buttons to record actions".into());
-            info!("Macro recording started for '{}'", macro_name);
+            // Start the key capture listener
+            match remap::KeyCaptureListener::start() {
+                Ok(listener) => {
+                    *key_listener_ref.borrow_mut() = Some(listener);
+                    mgr.start_recording(macro_name);
+                    win.set_macro_recording(true);
+                    win.set_selected_action_index(-1);  // Clear action selection
+                    // Clear the actions list
+                    let empty_list: Vec<slint::SharedString> = Vec::new();
+                    win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(empty_list)));
+                    win.set_status_message("🎤 Recording! Type keys anywhere - they'll be captured automatically".into());
+                    info!("Macro recording started for '{}'", macro_name);
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("Permission") || err_str.contains("permission") {
+                        win.set_status_message("❌ Permission denied - see instructions".into());
+                        win.set_macro_actions_text("⚠️ Permission required to capture keys!\n\n1. Add user to input group:\n   sudo usermod -aG input $USER\n   (then log out and back in)\n\nOR run app with:\n   sudo -E ./razerlinux".into());
+                    } else {
+                        win.set_status_message(format!("❌ Failed to start: {}", e).into());
+                    }
+                }
+            }
         }
     });
     
     let window_weak = window.as_weak();
     let macro_mgr = macro_manager.clone();
+    let key_listener_ref = key_listener.clone();
     window.on_stop_macro_recording(move || {
         if let Some(win) = window_weak.upgrade() {
+            // Stop the key listener
+            if let Some(listener) = key_listener_ref.borrow_mut().take() {
+                listener.stop();
+            }
+            
             let mut mgr = macro_mgr.borrow_mut();
             
             if let Some(recorded_macro) = mgr.stop_recording() {
                 win.set_macro_recording(false);
                 win.set_selected_macro_id(recorded_macro.id as i32);
                 win.set_current_macro_name(recorded_macro.name.clone().into());
-                win.set_macro_actions_text(recorded_macro.to_display_text().into());
+                // Update the actions list
+                let actions: Vec<slint::SharedString> = recorded_macro.actions.iter()
+                    .map(|a| a.to_display_string().into())
+                    .collect();
+                win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
                 win.set_macro_list_text(mgr.get_macros_list_text().into());
                 win.set_available_macros(mgr.get_available_macros_string().into());
-                win.set_status_message(format!("Recorded {} actions", recorded_macro.actions.len()).into());
+                win.set_status_message(format!("✅ Recorded {} actions", recorded_macro.actions.len()).into());
             } else {
                 win.set_macro_recording(false);
                 win.set_status_message("No recording in progress".into());
@@ -658,16 +695,72 @@ fn setup_callbacks(
         }
     });
     
+    // Polling timer to check for captured keys during recording
+    let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
+    let key_listener_poll = key_listener.clone();
+    let poll_timer = slint::Timer::default();
+    poll_timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(16), move || {
+        if let Some(win) = window_weak.upgrade() {
+            if !win.get_macro_recording() {
+                return;
+            }
+            
+            let listener_opt = key_listener_poll.borrow();
+            if let Some(listener) = listener_opt.as_ref() {
+                // Drain all available keys
+                let mut captured_any = false;
+                while let Some(key) = listener.try_recv() {
+                    captured_any = true;
+                    let mut mgr = macro_mgr.borrow_mut();
+                    if key.is_press {
+                        mgr.record_key_press(key.code);
+                    } else {
+                        mgr.record_key_release(key.code);
+                    }
+                }
+                
+                if captured_any {
+                    let mgr = macro_mgr.borrow();
+                    // Update the actions list model
+                    let actions: Vec<slint::SharedString> = mgr.get_recording_actions_list()
+                        .into_iter()
+                        .map(|s| s.into())
+                        .collect();
+                    win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
+                }
+            }
+        }
+    });
+    // Keep timer alive
+    std::mem::forget(poll_timer);
+    
     let window_weak = window.as_weak();
     let macro_mgr = macro_manager.clone();
     window.on_add_macro_keypress(move || {
         if let Some(win) = window_weak.upgrade() {
-            let mgr = macro_mgr.borrow();
-            if mgr.is_recording() {
-                win.set_status_message("Recording: press a key...".into());
-                // Keys are captured automatically during recording
+            let is_recording = macro_mgr.borrow().is_recording();
+            if !is_recording {
+                win.set_status_message("⚠️ Click 'Record' first to start capturing keys".into());
             } else {
-                win.set_status_message("Start recording first to add keypresses".into());
+                win.set_status_message("🎯 Just type on your keyboard - keys are captured automatically!".into());
+            }
+        }
+    });
+    
+    // Handler for captured keys from background thread
+    let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
+    window.on_record_captured_key(move |key_code, include_release| {
+        if let Some(win) = window_weak.upgrade() {
+            let mut mgr = macro_mgr.borrow_mut();
+            if mgr.is_recording() {
+                mgr.record_key_press(key_code as u16);
+                if include_release {
+                    mgr.record_key_release(key_code as u16);
+                }
+                win.set_macro_actions_text(mgr.get_recording_display_text().into());
+                win.set_status_message(format!("✓ Recorded key {}", key_name(key_code as u16).unwrap_or_else(|| format!("0x{:X}", key_code))).into());
             }
         }
     });
@@ -679,18 +772,48 @@ fn setup_callbacks(
             let mut mgr = macro_mgr.borrow_mut();
             if mgr.is_recording() {
                 mgr.add_delay(100);
-                win.set_macro_actions_text(mgr.get_recording_display_text().into());
+                // Update the actions list model
+                let actions: Vec<slint::SharedString> = mgr.get_recording_actions_list()
+                    .into_iter()
+                    .map(|s| s.into())
+                    .collect();
+                win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
                 win.set_status_message("Added 100ms delay".into());
             } else {
-                // Add delay to selected macro's display (visual only until save)
-                let current = win.get_macro_actions_text().to_string();
-                let new_text = if current == "No actions" {
-                    "⏱ 100ms".to_string()
+                win.set_status_message("Start recording first".into());
+            }
+        }
+    });
+    
+    // Handler to remove an action from recording or saved macro
+    let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
+    window.on_remove_macro_action(move |index| {
+        if let Some(win) = window_weak.upgrade() {
+            let mut mgr = macro_mgr.borrow_mut();
+            let is_recording = mgr.is_recording();
+            let selected_id = win.get_selected_macro_id();
+            
+            let removed = if is_recording {
+                // Remove from current recording
+                mgr.remove_recording_action(index as usize)
+            } else if selected_id > 0 {
+                // Remove from saved macro
+                mgr.remove_macro_action(selected_id as u32, index as usize)
+            } else {
+                false
+            };
+            
+            if removed {
+                // Update the actions list model
+                let actions: Vec<slint::SharedString> = if is_recording {
+                    mgr.get_recording_actions_list()
                 } else {
-                    format!("{}\n⏱ 100ms", current)
-                };
-                win.set_macro_actions_text(new_text.into());
-                win.set_status_message("Added 100ms delay (save to apply)".into());
+                    mgr.get_macro_actions_list(selected_id as u32)
+                }.into_iter().map(|s| s.into()).collect();
+                
+                win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
+                win.set_status_message("Removed action".into());
             }
         }
     });

@@ -191,6 +191,48 @@ impl MacroManager {
         }
     }
     
+    /// Get current recording actions as a list of display strings for UI
+    pub fn get_recording_actions_list(&self) -> Vec<String> {
+        if let Some(ref state) = self.recording {
+            state.macro_data.actions.iter().map(|a| a.to_display_string()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+    
+    /// Remove an action from the current recording at the given index
+    pub fn remove_recording_action(&mut self, index: usize) -> bool {
+        if let Some(ref mut state) = self.recording {
+            if index < state.macro_data.actions.len() {
+                state.macro_data.actions.remove(index);
+                info!("Removed action at index {}", index);
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Remove an action from a saved macro by ID and index
+    pub fn remove_macro_action(&mut self, macro_id: u32, index: usize) -> bool {
+        if let Some(m) = self.macros.get_mut(&macro_id) {
+            if index < m.actions.len() {
+                m.actions.remove(index);
+                info!("Removed action at index {} from macro {}", index, macro_id);
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Get actions list for a saved macro
+    pub fn get_macro_actions_list(&self, macro_id: u32) -> Vec<String> {
+        if let Some(m) = self.macros.get(&macro_id) {
+            m.actions.iter().map(|a| a.to_display_string()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+    
     /// Get list of macros as display text
     pub fn get_macros_list_text(&self) -> String {
         if self.macros.is_empty() {
