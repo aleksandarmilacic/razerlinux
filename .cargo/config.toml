@@ -1,0 +1,22 @@
+[build]
+# Uncomment if sccache is installed to speed up recompiles:
+# rustc-wrapper = "sccache"
+
+[target.x86_64-unknown-linux-gnu]
+# Force the system bfd linker (rust-lld was failing with hidden symbol errors)
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
+# If you later install mold, you can switch to it for speed:
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# linker = "clang"  # Only if you prefer clang; otherwise default gcc/ld is fine.
+
+[profile.dev]
+# Faster dev builds: fewer codegen units keep compile parallelism high; opt-level 1 for reasonable runtime.
+opt-level = 1
+debug = true
+incremental = true
+codegen-units = 16
+
+[profile.release]
+# Keep release reasonably fast to build while still optimized.
+codegen-units = 16
+lto = false

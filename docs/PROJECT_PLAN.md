@@ -564,6 +564,171 @@ razerlinux/
 
 ---
 
+## Troubleshooting: Side Button Detection
+
+### Problem
+
+Side buttons on the Razer Naga Trinity (especially the 12-button grid panel) are **NOT detected at all** during the "Learn" button capture process. Only left, right, and middle mouse buttons work.
+
+### Root Cause Analysis (CONFIRMED AND SOLVED)
+
+After extensive investigation including raw HID analysis, evdev monitoring, and OpenRazer source code review, the root cause has been identified and a solution implemented:
+
+**The Naga Trinity has two device modes:**
+- **Normal Mode (0x00)**: Side buttons send NO input at all
+- **Driver Mode (0x03)**: Side buttons send keyboard keys (1-9, 0, -, =)
+
+The device defaults to Normal Mode, which is why side buttons weren't detected. Switching to Driver Mode enables side button functionality!
+
+### Solution Implemented
+
+RazerLinux now automatically manages device mode:
+
+1. **On remapping enable**: Switches device to Driver Mode (0x03)
+2. **On remapping disable**: Restores Normal Mode (0x00)
+3. **On app startup**: Ensures device is in Normal Mode (clean state)
+
+In Driver Mode, the side buttons send standard keyboard key events:
+| Side Button | Key Code | Key Name |
+|-------------|----------|----------|
+| 1 | KEY_1 (2) | 1 |
+| 2 | KEY_2 (3) | 2 |
+| 3 | KEY_3 (4) | 3 |
+| 4 | KEY_4 (5) | 4 |
+| 5 | KEY_5 (6) | 5 |
+| 6 | KEY_6 (7) | 6 |
+| 7 | KEY_7 (8) | 7 |
+| 8 | KEY_8 (9) | 8 |
+| 9 | KEY_9 (10) | 9 |
+| 10 | KEY_0 (11) | 0 |
+| 11 | KEY_MINUS (12) | - |
+| 12 | KEY_EQUAL (13) | = |
+
+### Technical Details
+
+1. **Device Mode is correct**: The device reports mode 0x00 (Normal mode) which should send keyboard keypresses from side buttons.
+
+2. **Interfaces detected correctly**:
+   | Device | Name | Interface | Purpose |
+   |--------|------|-----------|---------|
+   | hidraw3 | Naga Trinity | input0 | Mouse + vendor data |
+   | hidraw4 | Naga Trinity | input1 | Keyboard interface |
+   | hidraw5 | Naga Trinity | input2 | Keyboard interface |
+   | event8 | Naga Trinity | input0 | 5 mouse buttons only |
+   | event9/11 | Naga Trinity Keyboard | input1/2 | Keyboard keys |
+
+3. **evdev receives NO events from side buttons**: Tested with `evtest` on all interfaces - absolutely no events when side buttons are pressed.
+
+4. **hidraw3 receives raw data**: Vendor-specific HID reports (Usage Page 0xFF00) are received on the mouse interface but NOT translated to evdev events.
+
+5. **OpenRazer kernel driver required**: The OpenRazer project has a kernel driver (`razermouse`) with a special `razer_raw_event()` function that intercepts and parses these vendor-specific reports. Without this driver, the side buttons simply don't work on Linux.
+
+### HID Report Structure (Mouse Interface)
+
+The Naga Trinity mouse interface (hidraw3) sends:
+- 5 button bits (standard mouse buttons)
+- 3 padding bits
+- **2 bytes of vendor-specific data** (Usage Page 0xFF00, Usage 0x40) ← Side panel data here!
+- 1 byte wheel
+- 2 x 16-bit X/Y position
+
+The vendor-specific bytes contain side panel button states, but `hid-generic` ignores them.
+
+### Solutions
+
+#### Solution 1: RazerLinux Driver Mode (Implemented ✓)
+
+RazerLinux now handles this automatically! When you enable button remapping:
+1. The app sends a USB control transfer to switch the device to Driver Mode
+2. Side buttons start sending keyboard key events
+3. The remapper captures and remaps these events
+4. When you disable remapping, Normal Mode is restored
+
+No kernel drivers or additional software needed!
+
+#### Alternative: Install OpenRazer
+
+```bash
+# openSUSE
+sudo zypper addrepo https://download.opensuse.org/repositories/hardware/openSUSE_Leap_15.6/hardware.repo
+sudo zypper refresh
+sudo zypper install openrazer-driver openrazer-daemon
+
+# Enable and start
+sudo modprobe razermouse
+systemctl --user enable openrazerdaemon
+systemctl --user start openrazerdaemon
+```
+
+Once OpenRazer is installed, side buttons will appear as standard keyboard events (KEY_1 through KEY_12 or F13-F24 depending on profile).
+
+#### Option 2: Use input-remapper
+
+The [input-remapper](https://github.com/sezanzeb/input-remapper) project handles Razer mice with side panels and can remap buttons without requiring kernel drivers for some use cases.
+
+```bash
+sudo zypper install input-remapper
+```
+
+#### Option 3: Userspace HID parsing (Future Enhancement)
+
+We could implement parsing of the vendor-specific HID reports directly from `/dev/hidraw3`. This would require:
+1. Opening hidraw3 in non-blocking mode
+2. Parsing the incoming HID reports (8-byte mouse reports)
+3. Extracting side button state from bytes 6-7 (vendor-specific data)
+4. Injecting synthetic evdev events via uinput
+
+This is complex but would provide a fully userspace solution without kernel drivers.
+
+### How to Check if Side Panel is Working
+
+```bash
+# 1. Check device mode (should be 0x00)
+# Run razerlinux and check logs for "Device mode: 0x00"
+
+# 2. Monitor all evdev interfaces
+sudo evtest /dev/input/event8  # Mouse buttons
+sudo evtest /dev/input/event9  # Should see side buttons IF working
+
+# 3. Monitor raw HID (requires sudo)
+sudo xxd /dev/hidraw3 | head -50
+# Press side buttons - look for changing patterns in bytes 6-7
+```
+
+### Physical Side Panel Check
+
+The Naga Trinity has **interchangeable side panels**:
+- 2-button panel (FPS)
+- 7-button ring (MOBA)
+- 12-button grid (MMO)
+
+Ensure a side panel is properly attached and seated. The magnetic connection should click firmly.
+
+---
+
+## Understanding the Naga Trinity Architecture
+
+### Why Side Buttons Don't Work Without Drivers
+
+The Razer Naga Trinity is a "composite" USB device with 3 HID interfaces:
+
+```
+USB Device 1532:0067 (Naga Trinity)
+├── Interface 0: Mouse (5 buttons + vendor extension)
+├── Interface 1: Keyboard (for side panel buttons)
+└── Interface 2: System Control / Consumer (media keys)
+```
+
+The side panel buttons are designed to send **standard keyboard keycodes** (like "1", "2", etc.) through Interface 1. However, the way these are encoded in the HID reports requires special handling:
+
+1. **Report ID 0x04**: Side button events use a special 16-byte report format
+2. **Non-standard encoding**: Button states are encoded differently than standard keyboards
+3. **OpenRazer translates these**: The kernel driver converts Report ID 4 data into proper evdev KEY events
+
+Without OpenRazer, the HID reports are received but not understood by `hid-generic`.
+
+---
+
 ## Questions for Decision
 
 1. ✅ **Technology stack** - Rust + Qt/Slint

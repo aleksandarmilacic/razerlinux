@@ -103,10 +103,12 @@ Or after building:
 
 #### Button Remapping (Software)
 - Requires `/dev/uinput` access; ensure the uinput module is loaded.
-- Works for all mouse buttons (left/right/middle/side/extra) as sources and for key/button targets.
-- In the Remapping panel: disable remapping, click “🎯 Learn Button”, press the desired mouse button to capture source.
+- **Side button support**: When remapping is enabled, RazerLinux automatically switches the Naga Trinity to "Driver Mode", which makes side buttons (1-12) send keyboard key events.
+- Works for all mouse buttons (left/right/middle/side/extra) and side panel buttons as sources.
+- In the Remapping panel: disable remapping, click "🎯 Learn Button", press the desired button to capture source.
 - Set a target code (presets coming soon) and optional modifiers (Ctrl/Alt/Shift/Meta), then click Add.
 - Enable remapping to start the virtual device; mappings persist in profiles.
+- When remapping is disabled, Normal Mode is restored.
 
 #### Profile Management
 - Save current settings to named profiles
@@ -199,12 +201,88 @@ Make sure you've installed the udev rules and replugged the mouse:
 ls -la /dev/hidraw*  # Should show crw-rw-rw- permissions
 ```
 
+Ensure your user is in the `input` group:
+```bash
+groups  # Should include 'input'
+sudo usermod -aG input $USER  # Add yourself if not
+# Log out and log back in for changes to take effect
+```
+
 ### Device not found
 
 Check that your mouse is detected:
 ```bash
 lsusb | grep 1532  # 1532 is Razer's USB Vendor ID
 ```
+
+### Side buttons not detected during "Learn"
+
+**UPDATE**: RazerLinux now handles side buttons automatically using Device Mode switching!
+
+#### How It Works
+
+The Razer Naga Trinity has two device modes:
+- **Normal Mode (0x00)**: Side buttons send NO input (default)
+- **Driver Mode (0x03)**: Side buttons send keyboard keys (1-9, 0, -, =)
+
+When you enable button remapping in RazerLinux, the app automatically switches to Driver Mode. This makes all 12 side panel buttons send standard keyboard events that can be captured and remapped.
+
+#### Side Button Key Mappings (in Driver Mode)
+
+| Side Button | Key Sent |
+|-------------|----------|
+| 1 | KEY_1 |
+| 2 | KEY_2 |
+| 3 | KEY_3 |
+| 4 | KEY_4 |
+| 5 | KEY_5 |
+| 6 | KEY_6 |
+| 7 | KEY_7 |
+| 8 | KEY_8 |
+| 9 | KEY_9 |
+| 10 | KEY_0 |
+| 11 | KEY_MINUS |
+| 12 | KEY_EQUAL |
+
+**No OpenRazer kernel driver required!**
+
+#### Alternative: Install OpenRazer (Optional)
+
+```bash
+# openSUSE
+sudo zypper addrepo https://download.opensuse.org/repositories/hardware/openSUSE_Leap_15.6/hardware.repo
+sudo zypper refresh
+sudo zypper install openrazer-driver openrazer-daemon
+sudo modprobe razermouse
+systemctl --user enable --now openrazerdaemon
+
+# Fedora
+sudo dnf install kernel-devel
+sudo dnf copr enable morbidick/openrazer
+sudo dnf install openrazer-driver openrazer-daemon
+
+# Ubuntu/Debian
+sudo add-apt-repository ppa:openrazer/stable
+sudo apt update
+sudo apt install openrazer-driver-dkms openrazer-daemon
+```
+
+After installing OpenRazer, reboot or reload the kernel module, then replug your mouse. Side buttons should now send keyboard events (KEY_1 through KEY_12 or similar).
+
+#### Verifying Side Button Detection
+
+```bash
+# Check if side buttons generate events (requires evtest)
+sudo zypper install evtest  # or apt/dnf equivalent
+sudo evtest /dev/input/event9  # Try different event numbers
+# Press side buttons - if working, you'll see KEY_* events
+```
+
+#### Without OpenRazer
+
+If you cannot install OpenRazer, consider using [input-remapper](https://github.com/sezanzeb/input-remapper) which may provide alternative handling for some Razer devices.
+
+**Note**: RazerLinux's DPI, polling rate, and profile features work WITHOUT OpenRazer. Only side panel button detection requires the kernel driver.
 
 ### GUI doesn't start
 
