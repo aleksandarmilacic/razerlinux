@@ -1,0 +1,592 @@
+// RazerLinux - Slint UI
+// Main window for Razer mouse configuration
+
+import { Button, VerticalBox, HorizontalBox, Slider, GroupBox, ComboBox, CheckBox, LineEdit, SpinBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "RazerLinux - Razer Mouse Configurator";
+    min-width: 600px;
+    min-height: 500px;
+    background: #1a1a2e;
+    
+    // Properties exposed to Rust
+    in-out property <string> device-name: "No device connected";
+    in-out property <string> firmware-version: "-";
+    in-out property <int> current-dpi-x: 800;
+    in-out property <int> current-dpi-y: 800;
+    in-out property <bool> device-connected: false;
+    in-out property <string> status-message: "Searching for device...";
+
+    // Remapping UI state
+    in-out property <bool> remap-enabled: false;
+    in-out property <int> remap-source-code: 0;
+    in-out property <int> remap-target-code: 1;
+    in-out property <bool> remap-mod-ctrl: false;
+    in-out property <bool> remap-mod-alt: false;
+    in-out property <bool> remap-mod-shift: false;
+    in-out property <bool> remap-mod-meta: false;
+    in-out property <string> remap-summary: "No mappings";
+    in-out property <string> remap-mapping-details: "Nothing mapped yet. Use Learn Button to capture a source, pick a target, then Add.";
+    in-out property <string> remap-target-label: "N/A";
+
+    
+    // Callbacks to Rust
+    callback apply-dpi(int, int);
+    callback refresh-device();
+    callback save-profile(string);
+    callback load-profile(string);
+
+    callback remap-set-enabled(bool);
+    callback remap-learn-source();
+    callback remap-add-mapping(int, int, bool, bool, bool, bool);
+    callback remap-clear();
+    callback remap-update-target-label(int, bool, bool, bool, bool);
+    
+    VerticalLayout {
+        padding: 20px;
+        spacing: 15px;
+        
+        // Header
+        Text {
+            text: "🐍 RazerLinux";
+            font-size: 28px;
+            font-weight: 700;
+            color: #00ff00;
+            horizontal-alignment: center;
+        }
+        
+        // Device Info Section
+        GroupBox {
+            title: "Device Information";
+            
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { 
+                        text: "Device:"; 
+                        color: #aaaaaa;
+                        min-width: 100px;
+                    }
+                    Text { 
+                        text: device-name; 
+                        color: device-connected ? #00ff00 : #ff4444;
+                        font-weight: 600;
+                    }
+                }
+                
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { 
+                        text: "Firmware:"; 
+                        color: #aaaaaa;
+                        min-width: 100px;
+                    }
+                    Text { 
+                        text: firmware-version; 
+                        color: #ffffff;
+                    }
+                }
+                
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { 
+                        text: "Status:"; 
+                        color: #aaaaaa;
+                        min-width: 100px;
+                    }
+                    Text { 
+                        text: status-message; 
+                        color: #88ff88;
+                    }
+                }
+            }
+        }
+        
+        // DPI Settings Section  
+        GroupBox {
+            title: "DPI Settings";
+            
+            VerticalLayout {
+                padding: 10px;
+                spacing: 15px;
+                
+                // DPI X
+                VerticalLayout {
+                    spacing: 5px;
+                    HorizontalLayout {
+                        Text { 
+                            text: "DPI X:"; 
+                            color: #aaaaaa;
+                            min-width: 60px;
+                        }
+                        Text { 
+                            text: current-dpi-x; 
+                            color: #00ff00;
+                            font-weight: 600;
+                            min-width: 50px;
+                        }
+                    }
+                    dpi-x-slider := Slider {
+                        minimum: 100;
+                        maximum: 16000;
+                        value: current-dpi-x;
+                        enabled: device-connected;
+                        changed(value) => {
+                            current-dpi-x = round(value / 100) * 100;
+                        }
+                    }
+                }
+                
+                // DPI Y
+                VerticalLayout {
+                    spacing: 5px;
+                    HorizontalLayout {
+                        Text { 
+                            text: "DPI Y:"; 
+                            color: #aaaaaa;
+                            min-width: 60px;
+                        }
+                        Text { 
+                            text: current-dpi-y; 
+                            color: #00ff00;
+                            font-weight: 600;
+                            min-width: 50px;
+                        }
+                    }
+                    dpi-y-slider := Slider {
+                        minimum: 100;
+                        maximum: 16000;
+                        value: current-dpi-y;
+                        enabled: device-connected;
+                        changed(value) => {
+                            current-dpi-y = round(value / 100) * 100;
+                        }
+                    }
+                }
+                
+                // Link X/Y checkbox and Apply button
+                HorizontalLayout {
+                    spacing: 15px;
+                    alignment: center;
+                    
+                    link-checkbox := CheckBox {
+                        text: "Link X/Y";
+                        checked: true;
+                    }
+                    
+                    Button {
+                        text: "Apply DPI";
+                        enabled: device-connected;
+                        clicked => {
+                            apply-dpi(current-dpi-x, current-dpi-y);
+                        }
+                    }
+                }
+                
+                // DPI Presets
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: center;
+                    
+                    Button {
+                        text: "400";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 400;
+                            current-dpi-y = 400;
+                        }
+                    }
+                    Button {
+                        text: "800";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 800;
+                            current-dpi-y = 800;
+                        }
+                    }
+                    Button {
+                        text: "1600";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 1600;
+                            current-dpi-y = 1600;
+                        }
+                    }
+                    Button {
+                        text: "3200";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 3200;
+                            current-dpi-y = 3200;
+                        }
+                    }
+                    Button {
+                        text: "6400";
+                        enabled: device-connected;
+                        clicked => {
+                            current-dpi-x = 6400;
+                            current-dpi-y = 6400;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Profile Section
+        GroupBox {
+            title: "Profiles";
+            
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 10px;
+                alignment: center;
+                
+                profile-name := LineEdit {
+                    placeholder-text: "Profile name";
+                    min-width: 150px;
+                }
+                
+                Button {
+                    text: "Save Profile";
+                    enabled: device-connected;
+                    clicked => {
+                        save-profile(profile-name.text);
+                    }
+                }
+                
+                Button {
+                    text: "Load Profile";
+                    clicked => {
+                        load-profile(profile-name.text);
+                    }
+                }
+            }
+        }
+
+        // Remapping Section
+        GroupBox {
+            title: "Button Remapping (Software)";
+
+            VerticalLayout {
+                padding: 10px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: center;
+
+                    CheckBox {
+                        text: "Enable remapping";
+                        checked: remap-enabled;
+                        toggled => {
+                            remap-enabled = self.checked;
+                            remap-set-enabled(self.checked);
+                        }
+                    }
+                }
+
+                Text {
+                    text: remap-summary;
+                    color: #cccccc;
+                    horizontal-alignment: center;
+                }
+
+                Rectangle {
+                    background: #111827;
+                    border-color: #1f2937;
+                    border-width: 1px;
+                    border-radius: 4px;
+                    padding: 8px;
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text { text: "Mappings"; color: #88ff88; font-weight: 600; }
+                        Text {
+                            text: remap-mapping-details;
+                            color: #bbbbbb;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: center;
+
+                    Button {
+                        text: "🎯 Learn Button";
+                        enabled: !remap-enabled;
+                        clicked => {
+                            remap-learn-source();
+                        }
+                    }
+
+                    Text { text: "Source code:"; color: #aaaaaa; }
+                    SpinBox {
+                        value: remap-source-code;
+                        minimum: 0;
+                        maximum: 65535;
+                        enabled: !remap-enabled;
+                        edited(value) => { remap-source-code = value; }
+                    }
+
+                    Text { text: "→ Target code:"; color: #aaaaaa; }
+                    SpinBox {
+                        value <=> remap-target-code;
+                        minimum: 0;
+                        maximum: 65535;
+                        enabled: !remap-enabled;
+                        edited(value) => {
+                            remap-target-code = value;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+
+                    CheckBox {
+                        text: "Ctrl";
+                        checked: remap-mod-ctrl;
+                        toggled => {
+                            remap-mod-ctrl = self.checked;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+                    CheckBox {
+                        text: "Alt";
+                        checked: remap-mod-alt;
+                        toggled => {
+                            remap-mod-alt = self.checked;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+                    CheckBox {
+                        text: "Shift";
+                        checked: remap-mod-shift;
+                        toggled => {
+                            remap-mod-shift = self.checked;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+                    CheckBox {
+                        text: "Meta";
+                        checked: remap-mod-meta;
+                        toggled => {
+                            remap-mod-meta = self.checked;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+
+                    Button {
+                        text: "Add";
+                        enabled: !remap-enabled;
+                        clicked => {
+                            remap-add-mapping(remap-source-code, remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+
+                    Button {
+                        text: "Clear";
+                        enabled: !remap-enabled;
+                        clicked => {
+                            remap-clear();
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Target preview: " + remap-target-code +
+                          (remap-mod-ctrl ? " Ctrl" : "") +
+                          (remap-mod-alt ? " Alt" : "") +
+                          (remap-mod-shift ? " Shift" : "") +
+                          (remap-mod-meta ? " Meta" : "");
+                    color: #aaaaaa;
+                    horizontal-alignment: center;
+                }
+
+                // Target presets for common mouse buttons
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+
+                    Text { text: "Target presets:"; color: #aaaaaa; }
+
+                    Button {
+                        text: "Left";
+                        enabled: !remap-enabled;
+                        clicked => {
+                            remap-target-code = 272;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+                    Button {
+                        text: "Right";
+                        enabled: !remap-enabled;
+                        clicked => {
+                            remap-target-code = 273;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+                    Button {
+                        text: "Middle";
+                        enabled: !remap-enabled;
+                        clicked => {
+                            remap-target-code = 274;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+                    Button {
+                        text: "Back";
+                        enabled: !remap-enabled;
+                        clicked => {
+                            remap-target-code = 278;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+                    Button {
+                        text: "Forward";
+                        enabled: !remap-enabled;
+                        clicked => {
+                            remap-target-code = 277;
+                            remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                        }
+                    }
+                }
+
+                // Target presets for common keys
+                VerticalLayout {
+                    spacing: 6px;
+                    alignment: center;
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: center;
+                        Text { text: "Key presets:"; color: #aaaaaa; }
+                        Button { text: "1"; enabled: !remap-enabled; clicked => { remap-target-code = 2; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "2"; enabled: !remap-enabled; clicked => { remap-target-code = 3; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "3"; enabled: !remap-enabled; clicked => { remap-target-code = 4; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "4"; enabled: !remap-enabled; clicked => { remap-target-code = 5; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "5"; enabled: !remap-enabled; clicked => { remap-target-code = 6; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "6"; enabled: !remap-enabled; clicked => { remap-target-code = 7; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "7"; enabled: !remap-enabled; clicked => { remap-target-code = 8; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "8"; enabled: !remap-enabled; clicked => { remap-target-code = 9; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "9"; enabled: !remap-enabled; clicked => { remap-target-code = 10; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "0"; enabled: !remap-enabled; clicked => { remap-target-code = 11; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: center;
+                        Text { text: "F-keys:"; color: #aaaaaa; }
+                        Button { text: "F1"; enabled: !remap-enabled; clicked => { remap-target-code = 59; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F2"; enabled: !remap-enabled; clicked => { remap-target-code = 60; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F3"; enabled: !remap-enabled; clicked => { remap-target-code = 61; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F4"; enabled: !remap-enabled; clicked => { remap-target-code = 62; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F5"; enabled: !remap-enabled; clicked => { remap-target-code = 63; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F6"; enabled: !remap-enabled; clicked => { remap-target-code = 64; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F7"; enabled: !remap-enabled; clicked => { remap-target-code = 65; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F8"; enabled: !remap-enabled; clicked => { remap-target-code = 66; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F9"; enabled: !remap-enabled; clicked => { remap-target-code = 67; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "F10"; enabled: !remap-enabled; clicked => { remap-target-code = 68; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: center;
+                        Text { text: "Arrows:"; color: #aaaaaa; }
+                        Button { text: "Up"; enabled: !remap-enabled; clicked => { remap-target-code = 103; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "Down"; enabled: !remap-enabled; clicked => { remap-target-code = 108; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "Left"; enabled: !remap-enabled; clicked => { remap-target-code = 105; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "Right"; enabled: !remap-enabled; clicked => { remap-target-code = 106; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "Space"; enabled: !remap-enabled; clicked => { remap-target-code = 57; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "Enter"; enabled: !remap-enabled; clicked => { remap-target-code = 28; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "Esc"; enabled: !remap-enabled; clicked => { remap-target-code = 1; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                        Button { text: "Tab"; enabled: !remap-enabled; clicked => { remap-target-code = 15; remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta); } }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: center;
+                        Text { text: "Shortcuts:"; color: #aaaaaa; }
+                        Button {
+                            text: "Copy (Ctrl+C)";
+                            enabled: !remap-enabled;
+                            clicked => {
+                                remap-target-code = 46; // KEY_C
+                                remap-mod-ctrl = true;
+                                remap-mod-alt = false;
+                                remap-mod-shift = false;
+                                remap-mod-meta = false;
+                                remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                            }
+                        }
+                        Button {
+                            text: "Paste (Ctrl+V)";
+                            enabled: !remap-enabled;
+                            clicked => {
+                                remap-target-code = 47; // KEY_V
+                                remap-mod-ctrl = true;
+                                remap-mod-alt = false;
+                                remap-mod-shift = false;
+                                remap-mod-meta = false;
+                                remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                            }
+                        }
+                        Button {
+                            text: "Cut (Ctrl+X)";
+                            enabled: !remap-enabled;
+                            clicked => {
+                                remap-target-code = 45; // KEY_X
+                                remap-mod-ctrl = true;
+                                remap-mod-alt = false;
+                                remap-mod-shift = false;
+                                remap-mod-meta = false;
+                                remap-update-target-label(remap-target-code, remap-mod-ctrl, remap-mod-alt, remap-mod-shift, remap-mod-meta);
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Friendly name: " + remap-target-label;
+                    color: #88ff88;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Tip: codes are Linux input key/button codes. Use Learn Button to capture a press.";
+                    font-size: 10px;
+                    color: #666666;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+        
+        // Spacer
+        Rectangle { 
+            vertical-stretch: 1;
+        }
+        
+        // Bottom toolbar
+        HorizontalLayout {
+            spacing: 10px;
+            alignment: center;
+            
+            Button {
+                text: "🔄 Refresh Device";
+                clicked => {
+                    refresh-device();
+                }
+            }
+        }
+        
+        // Footer
+        Text {
+            text: "RazerLinux v0.1.0 • GPL-3.0-only • © 2026 Aleksandar Milacic";
+            font-size: 10px;
+            color: #666666;
+            horizontal-alignment: center;
+        }
+    }
+}

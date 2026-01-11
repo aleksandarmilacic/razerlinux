@@ -1,12 +1,25 @@
 # Razer Naga Trinity - allow user access without root
 # Place in /etc/udev/rules.d/99-razermouse.rules
+#
+# IMPORTANT: The Naga Trinity exposes MULTIPLE input interfaces:
+#   - input0 (event8): Mouse with 5 buttons (left/right/middle/side/extra)  
+#   - input1 (event9): "Keyboard" - side panel sends keyboard scancodes here
+#   - input1 (event10): Absolute axis (touch/dial on some panels)
+#   - input2 (event11): Additional keyboard interface
+#
+# We need access to ALL interfaces to detect and remap side panel buttons.
 
-# USB device access
-SUBSYSTEM=="usb", ATTR{idVendor}=="1532", ATTR{idProduct}=="0067", MODE="0666", TAG+="uaccess"
+# USB device access (all Razer devices)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1532", MODE="0666", TAG+="uaccess"
 
-# hidraw device access (needed for HID communication)
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0067", MODE="0666", TAG+="uaccess"
+# hidraw device access (needed for HID communication - DPI, RGB, etc.)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", MODE="0666", TAG+="uaccess"
 
-# Add more Razer mice here as needed:
-# Razer DeathAdder V2: ATTR{idProduct}=="0084"
-# Razer Basilisk V3: ATTR{idProduct}=="0099"
+# Input devices (event*) - needed to read/grab inputs for remapping
+# This rule matches ALL input interfaces from Razer devices
+SUBSYSTEM=="input", ATTRS{idVendor}=="1532", MODE="0666", TAG+="uaccess"
+
+# Specific Razer mice (uncomment and add your device's product ID if needed):
+# Razer Naga Trinity: 0067
+# Razer DeathAdder V2: 0084
+# Razer Basilisk V3: 0099

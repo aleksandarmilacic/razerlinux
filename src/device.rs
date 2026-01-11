@@ -10,6 +10,12 @@ pub const RAZER_VENDOR_ID: u16 = 0x1532;
 /// Razer Naga Trinity Product ID
 pub const NAGA_TRINITY_PID: u16 = 0x0067;
 
+/// Device mode constants
+/// In Normal mode (0x00), side buttons don't send any input
+/// In Driver mode (0x03), side buttons send keyboard keys (1-9, 0, -, =, etc.)
+pub const DEVICE_MODE_NORMAL: u8 = 0x00;
+pub const DEVICE_MODE_DRIVER: u8 = 0x03;
+
 /// Information about a detected Razer device
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -238,6 +244,51 @@ impl RazerDevice {
         report.data_size = 1;
 
         let _response = self.send_command(&report)?;
+        Ok(())
+    }
+
+    /// Get the current device mode
+    /// Returns (mode, param) where:
+    /// - mode 0x00 = Normal mode (side buttons send keypresses)
+    /// - mode 0x03 = Driver mode (side buttons sent via special reports)
+    pub fn get_device_mode(&mut self) -> Result<(u8, u8)> {
+        let report = RazerReport::new(Command::GetDeviceMode);
+        let response = self.send_command(&report)?;
+
+        tracing::debug!("Device mode response: {:02x?}", &response.data[0..4]);
+
+        Ok((response.data[0], response.data[1]))
+    }
+
+    /// Set the device mode
+    /// - mode 0x00, param 0x00 = Normal mode (hardware handles buttons)
+    /// - mode 0x03, param 0x00 = Driver mode (buttons sent via HID reports)
+    pub fn set_device_mode(&mut self, mode: u8, param: u8) -> Result<()> {
+        let mut report = RazerReport::new(Command::SetDeviceMode);
+        report.data[0] = mode;
+        report.data[1] = param;
+        report.data_size = 2;
+
+        let _response = self.send_command(&report)?;
+        tracing::info!("Device mode set to: mode={:#04x}, param={:#04x}", mode, param);
+        Ok(())
+    }
+
+    /// Enable Driver Mode - required for side button remapping
+    /// In Driver Mode, side buttons 1-12 send keyboard keys (1-9, 0, -, =)
+    /// which can then be captured and remapped by the software.
+    pub fn enable_driver_mode(&mut self) -> Result<()> {
+        self.set_device_mode(DEVICE_MODE_DRIVER, 0x00)?;
+        tracing::info!("Driver mode enabled - side buttons will send keyboard keys");
+        Ok(())
+    }
+
+    /// Disable Driver Mode - return to Normal Mode
+    /// In Normal Mode, side buttons don't generate any input events.
+    /// This should be called when stopping the remapper.
+    pub fn disable_driver_mode(&mut self) -> Result<()> {
+        self.set_device_mode(DEVICE_MODE_NORMAL, 0x00)?;
+        tracing::info!("Normal mode restored - side buttons disabled");
         Ok(())
     }
 }

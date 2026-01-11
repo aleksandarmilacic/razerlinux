@@ -4,6 +4,8 @@
 //! without requiring kernel drivers.
 
 mod device;
+mod hidpoll;
+mod overlay;
 mod profile;
 mod protocol;
 mod remap;
@@ -24,6 +26,21 @@ fn main() -> Result<()> {
 
     info!("RazerLinux starting...");
 
+    // Log all detected Razer input interfaces for debugging
+    let interfaces = remap::list_razer_input_interfaces();
+    if interfaces.is_empty() {
+        info!("No Razer input interfaces found in /dev/input/");
+    } else {
+        info!("Detected {} Razer input interface(s):", interfaces.len());
+        for iface in &interfaces {
+            info!(
+                "  {:?}: '{}' [mouse_btns={}, kbd_keys={}, buttons={}, keys={}]",
+                iface.path, iface.name, iface.has_mouse_buttons, iface.has_keyboard_keys,
+                iface.num_buttons, iface.num_keys
+            );
+        }
+    }
+
     // Create the main window
     let main_window = MainWindow::new()?;
 
@@ -34,12 +51,21 @@ fn main() -> Result<()> {
     let remapper: Rc<RefCell<Option<remap::Remapper>>> = Rc::new(RefCell::new(None));
     let remap_mappings: Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>> =
         Rc::new(RefCell::new(BTreeMap::new()));
+    
+    // Autoscroll enabled state (Windows-style middle-click scroll)
+    let autoscroll_enabled: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    
+    // Autoscroll overlay (Phase 2 - visual indicator)
+    let autoscroll_overlay: Rc<RefCell<Option<overlay::AutoscrollOverlay>>> = Rc::new(RefCell::new(None));
+    
+    // DPI button poller - polls hidraw for DPI button presses and injects F13/F14 events
+    let dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>> = Rc::new(RefCell::new(None));
 
     // Try to find and connect to device on startup
     connect_device(&main_window, &device);
 
     // Setup callbacks
-    setup_callbacks(&main_window, device, remapper, remap_mappings);
+    setup_callbacks(&main_window, device, remapper, remap_mappings, dpi_poller, autoscroll_enabled, autoscroll_overlay);
 
     // Run the GUI event loop
     info!("Starting GUI...");
@@ -57,6 +83,27 @@ fn connect_device(window: &MainWindow, device: &Rc<RefCell<Option<device::RazerD
             match device::RazerDevice::open(&device_info.path) {
                 Ok(mut dev) => {
                     info!("Device opened successfully!");
+
+                    // Check and log device mode
+                    match dev.get_device_mode() {
+                        Ok((mode, param)) => {
+                            info!("Device mode: {:#04x}, param: {:#04x}", mode, param);
+                            // Mode 0x00 = Normal (hardware handles buttons)
+                            // Mode 0x03 = Driver mode (software handles buttons - side buttons send keyboard keys)
+                            if mode == 0x00 {
+                                info!("Device is in Normal mode");
+                            } else if mode == 0x03 {
+                                info!("Device is in Driver mode - restoring Normal mode on startup");
+                                // Ensure we're in Normal mode on startup for clean state
+                                if let Err(e) = dev.disable_driver_mode() {
+                                    warn!("Failed to restore Normal mode: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to get device mode: {} (this may be normal)", e);
+                        }
+                    }
 
                     // Update UI with device info
                     window.set_device_name(device_info.product.into());
@@ -108,6 +155,9 @@ fn setup_callbacks(
     device: Rc<RefCell<Option<device::RazerDevice>>>,
     remapper: Rc<RefCell<Option<remap::Remapper>>>,
     remap_mappings: Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+    dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
+    autoscroll_enabled: Rc<RefCell<bool>>,
+    autoscroll_overlay: Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
 ) {
     // Apply DPI callback
     let device_clone = device.clone();
@@ -176,6 +226,7 @@ fn setup_callbacks(
                     alt: t.mods.alt,
                     shift: t.mods.shift,
                     meta: t.mods.meta,
+                    macro_id: None,
                 })
                 .collect();
 
@@ -204,6 +255,9 @@ fn setup_callbacks(
     let device_clone = device.clone();
     let remap_mappings_clone = remap_mappings.clone();
     let remapper_clone = remapper.clone();
+    let dpi_poller_clone = dpi_poller.clone();
+    let autoscroll_clone = autoscroll_enabled.clone();
+    let overlay_clone = autoscroll_overlay.clone();
     let window_weak = window.as_weak();
     window.on_load_profile(move |profile_name| {
         info!("Loading profile: {}", profile_name);
@@ -253,9 +307,10 @@ fn setup_callbacks(
 
                             // Start/stop remapper to match profile
                             if profile.remap.enabled {
-                                start_remapper(&win, &remapper_clone, &remap_mappings_clone);
+                                let autoscroll = *autoscroll_clone.borrow();
+                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll);
                             } else {
-                                stop_remapper(&remapper_clone);
+                                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                             }
 
                             win.set_status_message(format!("Profile '{}' loaded!", name).into());
@@ -270,33 +325,78 @@ fn setup_callbacks(
 
     // Remap enable/disable
     let window_weak = window.as_weak();
+    let device_clone = device.clone();
     let remapper_clone = remapper.clone();
     let remap_mappings_clone = remap_mappings.clone();
+    let dpi_poller_clone = dpi_poller.clone();
+    let autoscroll_clone = autoscroll_enabled.clone();
+    let overlay_clone = autoscroll_overlay.clone();
     window.on_remap_set_enabled(move |enabled| {
         if let Some(win) = window_weak.upgrade() {
             if enabled {
-                start_remapper(&win, &remapper_clone, &remap_mappings_clone);
+                let autoscroll = *autoscroll_clone.borrow();
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll);
             } else {
-                stop_remapper(&remapper_clone);
+                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                 win.set_status_message("Remapping disabled".into());
             }
         }
     });
 
-    // Learn next button/key code
+    // Autoscroll toggle - requires restart of remapper to take effect
     let window_weak = window.as_weak();
+    let autoscroll_clone = autoscroll_enabled.clone();
+    let remapper_clone = remapper.clone();
+    let device_clone = device.clone();
+    let remap_mappings_clone = remap_mappings.clone();
+    let dpi_poller_clone = dpi_poller.clone();
+    let overlay_clone = autoscroll_overlay.clone();
+    window.on_autoscroll_set_enabled(move |enabled| {
+        info!("Autoscroll set to: {}", enabled);
+        *autoscroll_clone.borrow_mut() = enabled;
+        
+        // If remapper is running, restart it to apply new autoscroll setting
+        if remapper_clone.borrow().is_some() {
+            if let Some(win) = window_weak.upgrade() {
+                info!("Restarting remapper to apply autoscroll setting");
+                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
+                // Give time for devices to be properly ungrabbed
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, enabled);
+            }
+        }
+    });
+
+    // Learn next button/key code (temporarily pause remapper so grabs don't block input)
+    // Note: We use pause_remapper here to keep driver mode enabled, so side buttons can be learned
+    let window_weak = window.as_weak();
+    let remapper_clone = remapper.clone();
     window.on_remap_learn_source(move || {
-        let window_weak = window_weak.clone();
+        let was_enabled = remapper_clone.borrow().is_some();
+        if was_enabled {
+            pause_remapper(&remapper_clone);
+            if let Some(win) = window_weak.upgrade() {
+                win.set_remap_enabled(false);
+                win.set_status_message("Paused remapping to learn source; press a button within 10s".into());
+            }
+        }
+
+        let window_weak_inner = window_weak.clone();
         std::thread::spawn(move || {
-            let result = remap::capture_next_key_code(Duration::from_secs(5), None);
+            info!("Learn thread started, capturing next button press...");
+            let result = remap::capture_next_key_code(Duration::from_secs(10), None);
             slint::invoke_from_event_loop(move || {
-                if let Some(win) = window_weak.upgrade() {
+                if let Some(win) = window_weak_inner.upgrade() {
                     match result {
                         Ok(code) => {
+                            info!("Learn captured code: {}", code);
                             win.set_remap_source_code(code as i32);
                             win.set_status_message(format!("Captured source code: {code}").into());
                         }
-                        Err(e) => win.set_status_message(format!("Learn failed: {e}").into()),
+                        Err(e) => {
+                            warn!("Learn failed: {}", e);
+                            win.set_status_message(format!("Learn failed: {e}").into());
+                        }
                     }
                 }
             })
@@ -355,6 +455,21 @@ fn setup_callbacks(
                 })
             )
             .into());
+            
+            // Reset source code and modifiers so user can configure next mapping cleanly
+            win.set_remap_source_code(0);
+            win.set_remap_mod_ctrl(false);
+            win.set_remap_mod_alt(false);
+            win.set_remap_mod_shift(false);
+            win.set_remap_mod_meta(false);
+            // Update the target label to reflect reset state
+            win.invoke_remap_update_target_label(
+                win.get_remap_target_code(),
+                false,
+                false,
+                false,
+                false,
+            );
         }
     });
 
@@ -368,57 +483,326 @@ fn setup_callbacks(
             win.set_status_message("Mappings cleared".into());
         }
     });
+
+    // Remove a single mapping by source code
+    let window_weak = window.as_weak();
+    let remap_mappings_clone = remap_mappings.clone();
+    window.on_remap_remove_mapping(move |source| {
+        if let Some(win) = window_weak.upgrade() {
+            let s = source as u16;
+            if remap_mappings_clone.borrow_mut().remove(&s).is_some() {
+                update_remap_summary(&win, &remap_mappings_clone.borrow());
+                win.set_status_message(format!("Removed mapping for button (code {})", s).into());
+            } else {
+                win.set_status_message(format!("No mapping found for code {}", s).into());
+            }
+        }
+    });
+    
+    // =====================
+    // Macro Callbacks (stubs for now)
+    // =====================
+    
+    let window_weak = window.as_weak();
+    window.on_new_macro(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("New macro requested");
+            win.set_current_macro_name("".into());
+            win.set_macro_actions_text("No actions".into());
+            win.set_selected_macro_id(0);
+            win.set_status_message("Creating new macro...".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_edit_macro(move |macro_id| {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Edit macro {} requested", macro_id);
+            win.set_status_message(format!("Editing macro {}", macro_id).into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_delete_macro(move |macro_id| {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Delete macro {} requested", macro_id);
+            win.set_status_message(format!("Deleted macro {}", macro_id).into());
+            win.set_macro_list_text("No macros defined".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_save_macro(move |name, repeat| {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Save macro '{}' with repeat={}", name, repeat);
+            if name.is_empty() {
+                win.set_status_message("Please enter a macro name".into());
+                return;
+            }
+            win.set_status_message(format!("Saved macro '{}'", name).into());
+            // TODO: Actually save to profile
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_start_macro_recording(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Macro recording started");
+            win.set_macro_recording(true);
+            win.set_status_message("Recording macro... press keys to record".into());
+            win.set_macro_actions_text("Recording...".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_stop_macro_recording(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Macro recording stopped");
+            win.set_macro_recording(false);
+            win.set_status_message("Recording stopped".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_add_macro_keypress(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Add keypress to macro");
+            win.set_status_message("Click a key to add to macro...".into());
+            // TODO: Implement key capture
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_add_macro_delay(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Add delay to macro");
+            // Add a default 100ms delay
+            let current = win.get_macro_actions_text().to_string();
+            let new_text = if current == "No actions" || current == "Recording..." {
+                "⏱ 100ms".to_string()
+            } else {
+                format!("{}\n⏱ 100ms", current)
+            };
+            win.set_macro_actions_text(new_text.into());
+            win.set_status_message("Added 100ms delay".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_test_macro(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Test macro requested");
+            win.set_status_message("Testing macro... (not implemented yet)".into());
+            // TODO: Actually execute the macro via uinput
+        }
+    });
 }
 
 fn start_remapper(
     win: &MainWindow,
+    device: &Rc<RefCell<Option<device::RazerDevice>>>,
     remapper: &Rc<RefCell<Option<remap::Remapper>>>,
     mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+    dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
+    autoscroll_overlay: &Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
+    autoscroll_enabled: bool,
 ) {
     if remapper.borrow().is_some() {
         win.set_status_message("Remapping already enabled".into());
         return;
     }
 
+    // Enable Driver Mode - this makes side buttons send keyboard keys
+    // which can then be captured and remapped
+    if let Some(ref mut dev) = *device.borrow_mut() {
+        match dev.enable_driver_mode() {
+            Ok(()) => {
+                info!("Driver mode enabled for side button remapping");
+            }
+            Err(e) => {
+                warn!("Failed to enable driver mode: {} - side buttons may not work", e);
+                win.set_status_message(format!("Warning: Could not enable driver mode: {}", e).into());
+            }
+        }
+    } else {
+        warn!("No device connected - cannot enable driver mode");
+    }
+
     let config = remap::RemapConfig {
         source_device: None,
         mappings: mappings.borrow().clone(),
+        autoscroll_enabled,
     };
 
-    match remap::Remapper::start(config) {
+    // Start the DPI button poller FIRST so its virtual device exists
+    // when the remapper enumerates devices
+    if dpi_poller.borrow().is_none() {
+        match hidpoll::DpiButtonPoller::start() {
+            Ok(poller) => {
+                info!("DPI button poller started");
+                *dpi_poller.borrow_mut() = Some(poller);
+                // Brief delay to let uinput device be created
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                warn!("Failed to start DPI poller: {} - DPI buttons won't be remappable", e);
+            }
+        }
+    }
+
+    // Create overlay for autoscroll if enabled
+    let overlay_sender = if autoscroll_enabled {
+        match overlay::AutoscrollOverlay::start() {
+            Ok(ol) => {
+                let sender = ol.sender();
+                *autoscroll_overlay.borrow_mut() = Some(ol);
+                info!("Autoscroll overlay created");
+                Some(sender)
+            }
+            Err(e) => {
+                warn!("Failed to create autoscroll overlay: {} - will work without visual indicator", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    match remap::Remapper::start(config, overlay_sender) {
         Ok(r) => {
             *remapper.borrow_mut() = Some(r);
             win.set_status_message("Remapping enabled (virtual device active)".into());
         }
         Err(e) => {
+            // If remapper fails, restore normal mode
+            if let Some(ref mut dev) = *device.borrow_mut() {
+                let _ = dev.disable_driver_mode();
+            }
+            // Also stop DPI poller if remapper fails
+            if let Some(poller) = dpi_poller.borrow_mut().take() {
+                poller.stop();
+            }
+            // Clean up overlay
+            if let Some(ol) = autoscroll_overlay.borrow_mut().take() {
+                ol.shutdown();
+            }
             win.set_remap_enabled(false);
             win.set_status_message(format!("Remap start failed: {e}").into());
         }
     }
 }
 
-fn stop_remapper(remapper: &Rc<RefCell<Option<remap::Remapper>>>) {
+fn stop_remapper(
+    device: &Rc<RefCell<Option<device::RazerDevice>>>,
+    remapper: &Rc<RefCell<Option<remap::Remapper>>>,
+    dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
+    autoscroll_overlay: &Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
+) {
+    if let Some(r) = remapper.borrow_mut().take() {
+        r.stop();
+    }
+    
+    // Stop the DPI button poller
+    if let Some(p) = dpi_poller.borrow_mut().take() {
+        p.stop();
+        info!("DPI button poller stopped");
+    }
+    
+    // Stop the autoscroll overlay
+    if let Some(ol) = autoscroll_overlay.borrow_mut().take() {
+        ol.shutdown();
+        info!("Autoscroll overlay stopped");
+    }
+
+    // Disable Driver Mode - restore normal operation
+    if let Some(ref mut dev) = *device.borrow_mut() {
+        match dev.disable_driver_mode() {
+            Ok(()) => {
+                info!("Driver mode disabled - restored normal mode");
+            }
+            Err(e) => {
+                warn!("Failed to disable driver mode: {}", e);
+            }
+        }
+    }
+}
+
+/// Stop remapper without changing device mode (used when pausing for learning)
+fn pause_remapper(remapper: &Rc<RefCell<Option<remap::Remapper>>>) {
     if let Some(r) = remapper.borrow_mut().take() {
         r.stop();
     }
 }
 
+/// Update the individual button mapping labels in the UI
+/// Side buttons map to KEY_1=2 through KEY_EQUAL=13
+/// Thumb buttons map to BTN_SIDE=275, BTN_EXTRA=276
+fn update_button_mapping_labels(win: &MainWindow, mappings: &BTreeMap<u16, remap::MappingTarget>) {
+    // Side button key codes in Driver Mode: KEY_1(2) through KEY_EQUAL(13)
+    // Button 1 = KEY_1 = 2, Button 2 = KEY_2 = 3, ..., Button 12 = KEY_EQUAL = 13
+    let get_mapping = |code: u16| -> String {
+        mappings.get(&code)
+            .map(|t| format_mapping_target(t))
+            .unwrap_or_default()
+    };
+    
+    win.set_btn1_mapping(get_mapping(2).into());   // KEY_1
+    win.set_btn2_mapping(get_mapping(3).into());   // KEY_2
+    win.set_btn3_mapping(get_mapping(4).into());   // KEY_3
+    win.set_btn4_mapping(get_mapping(5).into());   // KEY_4
+    win.set_btn5_mapping(get_mapping(6).into());   // KEY_5
+    win.set_btn6_mapping(get_mapping(7).into());   // KEY_6
+    win.set_btn7_mapping(get_mapping(8).into());   // KEY_7
+    win.set_btn8_mapping(get_mapping(9).into());   // KEY_8
+    win.set_btn9_mapping(get_mapping(10).into());  // KEY_9
+    win.set_btn10_mapping(get_mapping(11).into()); // KEY_0
+    win.set_btn11_mapping(get_mapping(12).into()); // KEY_MINUS
+    win.set_btn12_mapping(get_mapping(13).into()); // KEY_EQUAL
+    
+    // Mouse buttons (only 3 exist on Naga Trinity: MIDDLE, SIDE, EXTRA)
+    win.set_btn_middle_mapping(get_mapping(274).into());  // BTN_MIDDLE - scroll wheel click
+    win.set_btn_side_mapping(get_mapping(275).into());    // BTN_SIDE - thumb back
+    win.set_btn_extra_mapping(get_mapping(276).into());   // BTN_EXTRA - thumb forward
+    
+    // DPI buttons (captured via hidraw, injected as F13/F14)
+    win.set_btn_dpi_down_mapping(get_mapping(184).into()); // KEY_F14 - DPI Down
+    win.set_btn_dpi_up_mapping(get_mapping(183).into());   // KEY_F13 - DPI Up
+}
+
 fn update_remap_summary(win: &MainWindow, mappings: &BTreeMap<u16, remap::MappingTarget>) {
+    // Update individual button mapping labels (side buttons are KEY_1=2 through KEY_EQUAL=13)
+    update_button_mapping_labels(win, mappings);
+    
     if mappings.is_empty() {
         win.set_remap_summary("No mappings".into());
+        win.set_remap_mapping_details(
+            "Click a side button to select it, then choose a target action.".into(),
+        );
         return;
     }
 
-    // Keep it short for the UI.
-    let mut parts: Vec<String> = mappings
+    // Keep the one-line summary compact.
+    let mut summary_parts: Vec<String> = mappings
         .iter()
         .take(6)
         .map(|(s, t)| format!("{s}->{}", format_mapping_target(t)))
         .collect();
     if mappings.len() > 6 {
-        parts.push(format!("+{} more", mappings.len() - 6));
+        summary_parts.push(format!("+{} more", mappings.len() - 6));
     }
-    win.set_remap_summary(parts.join("  ").into());
+    win.set_remap_summary(summary_parts.join("  ").into());
+
+    // Show a fuller list (truncated for readability) with guidance.
+    let mut detail_lines: Vec<String> = mappings
+        .iter()
+        .take(12)
+        .map(|(s, t)| format!("{s} → {}", format_mapping_target(t)))
+        .collect();
+    if mappings.len() > 12 {
+        detail_lines.push(format!("+{} more mappings", mappings.len() - 12));
+    }
+    detail_lines.push("Tip: map side buttons to numbers or shortcuts you use often.".into());
+    win.set_remap_mapping_details(detail_lines.join("\n").into());
 }
 
 fn format_mapping_target(t: &remap::MappingTarget) -> String {
@@ -462,18 +846,37 @@ fn key_name(code: u16) -> Option<String> {
         70 => Some("F12".into()),
         28 => Some("Enter".into()),
         57 => Some("Space".into()),
+        // Navigation keys
+        102 => Some("Home".into()),
         103 => Some("Up".into()),
-        108 => Some("Down".into()),
+        104 => Some("Page Up".into()),
         105 => Some("Left".into()),
         106 => Some("Right".into()),
-        272 => Some("BtnLeft".into()),
-        273 => Some("BtnRight".into()),
-        274 => Some("BtnMiddle".into()),
-        275 => Some("BtnSide".into()),
-        276 => Some("BtnExtra".into()),
-        277 => Some("BtnForward".into()),
-        278 => Some("BtnBack".into()),
+        107 => Some("End".into()),
+        108 => Some("Down".into()),
+        109 => Some("Page Down".into()),
+        110 => Some("Insert".into()),
+        111 => Some("Delete".into()),
+        // Mouse buttons
+        272 => Some("Left Click".into()),
+        273 => Some("Right Click".into()),
+        274 => Some("Middle Click".into()),
+        275 => Some("Side (Back)".into()),
+        276 => Some("Extra (Fwd)".into()),
+        277 => Some("Forward".into()),
+        278 => Some("Back".into()),
         279 => Some("BtnTask".into()),
+        280 => Some("Scroll Up".into()),
+        281 => Some("Scroll Down".into()),
+        // Common keyboard keys
+        30 => Some("A".into()),
+        31 => Some("S".into()),
+        44 => Some("Z".into()),
+        45 => Some("X".into()),
+        46 => Some("C".into()),
+        47 => Some("V".into()),
+        87 => Some("F11".into()),
+        88 => Some("F12".into()),
         _ => None,
     }
 }

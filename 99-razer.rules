@@ -1,0 +1,19 @@
+# Razer device permissions
+# Allow users to access Razer devices for reading inputs and sending configuration commands
+# 
+# IMPORTANT: The Razer Naga Trinity (and similar mice) expose MULTIPLE input interfaces:
+#   - input0: Mouse interface (5 buttons: left/right/middle/side/extra)
+#   - input1: Keyboard interface (receives side panel keys as keyboard scancodes)
+#   - input2: Another keyboard interface (may also receive side panel keys)
+# 
+# We need access to ALL of these interfaces to properly capture and remap side buttons.
+
+# Input nodes (event*) - needed for remapping/reading source
+# This matches ALL Razer input devices across all interfaces
+SUBSYSTEM=="input", ATTRS{idVendor}=="1532", TAG+="uaccess"
+
+# HIDRaw nodes - needed for configuring DPI/RGB via HID feature reports
+KERNEL=="hidraw*", ATTRS{idVendor}=="1532", TAG+="uaccess"
+
+# USB device nodes - for direct USB access if needed
+SUBSYSTEM=="usb", ATTR{idVendor}=="1532", TAG+="uaccess"

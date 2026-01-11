@@ -42,6 +42,8 @@ pub enum Command {
     GetSerialNumber,
     GetPollingRate,
     SetPollingRate,
+    GetDeviceMode,
+    SetDeviceMode,
 
     // Mouse commands
     GetDpi,
@@ -57,6 +59,8 @@ impl Command {
             Command::GetSerialNumber => (0x00, 0x82),
             Command::GetPollingRate => (0x00, 0x85),
             Command::SetPollingRate => (0x00, 0x05),
+            Command::GetDeviceMode => (0x00, 0x84),
+            Command::SetDeviceMode => (0x00, 0x04),
 
             // Mouse commands (class 0x04)
             Command::GetDpi => (0x04, 0x85),
@@ -72,6 +76,8 @@ impl Command {
             Command::GetSerialNumber => 0x16,    // Returns 22-byte serial
             Command::GetPollingRate => 0x01,     // Returns 1 byte
             Command::SetPollingRate => 0x01,
+            Command::GetDeviceMode => 0x02,      // Returns 2 bytes (mode, param)
+            Command::SetDeviceMode => 0x02,      // Takes 2 bytes (mode, param)
             Command::GetDpi => 0x07, // CRITICAL: must be 0x07 for DPI query
             Command::SetDpi => 0x07,
         }

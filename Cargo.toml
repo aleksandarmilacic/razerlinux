@@ -38,5 +38,8 @@ tracing-subscriber = "0.3"
 # GUI - Slint (Qt-like, pure Rust)
 slint = "1"
 
+# X11 for overlay window (autoscroll indicator)
+x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+
 [build-dependencies]
 slint-build = "1"
