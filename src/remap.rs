@@ -27,6 +27,8 @@ pub struct RemapConfig {
 pub struct RemapConfigExt {
     pub config: RemapConfig,
     pub overlay_sender: Option<Sender<OverlayCommand>>,
+    /// Macros available for execution (cloned from MacroManager at start)
+    pub macros: std::collections::HashMap<u32, crate::profile::Macro>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,13 +142,18 @@ pub struct Remapper {
 }
 
 impl Remapper {
-    pub fn start(config: RemapConfig, overlay_sender: Option<Sender<OverlayCommand>>) -> Result<Self> {
+    pub fn start(
+        config: RemapConfig, 
+        overlay_sender: Option<Sender<OverlayCommand>>,
+        macros: std::collections::HashMap<u32, crate::profile::Macro>,
+    ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
 
         let ext_config = RemapConfigExt {
             config,
             overlay_sender,
+            macros,
         };
 
         let join = thread::spawn(move || {
@@ -181,6 +188,7 @@ impl Drop for Remapper {
 fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Result<()> {
     let config = ext_config.config;
     let overlay_sender = ext_config.overlay_sender;
+    let macros = ext_config.macros;
     
     // Find ALL Razer keyboard interfaces - the Naga Trinity sends side button keys
     // through multiple interfaces (event9 AND event11), so we need to grab them all
@@ -434,7 +442,7 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                 info!("KEY event: code={}, value={}", key.code(), ev.value());
                             }
                             InputEventKind::RelAxis(axis) => {
-                                info!("REL event: axis={:?}, value={}", axis, ev.value());
+                            info!("REL event: axis={:?}, value={}", axis, ev.value());
                             }
                             InputEventKind::Synchronization(_) => {
                                 // Don't log sync events (too noisy)
@@ -443,7 +451,7 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                 info!("OTHER event: type={:?}, code={}, value={}", ev.event_type(), ev.code(), ev.value());
                             }
                         }
-                        if let Some(mapped_events) = remap_events(&config.mappings, ev) {
+                        if let Some(mapped_events) = remap_events(&config.mappings, ev, &macros) {
                             if let Err(e) = vdev.emit(&mapped_events) {
                                 warn!("uinput emit failed: {e}");
                             }
@@ -472,10 +480,13 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
 fn remap_events(
     mappings: &BTreeMap<u16, MappingTarget>,
     ev: InputEvent,
+    macros: &std::collections::HashMap<u32, crate::profile::Macro>,
 ) -> Option<Vec<InputEvent>> {
     // Special codes for scroll wheel emulation
     const SCROLL_UP_CODE: u16 = 280;
     const SCROLL_DOWN_CODE: u16 = 281;
+    // Macro target codes are 1000+ (1001 = macro id 1, etc.)
+    const MACRO_CODE_BASE: u16 = 1000;
     // REL_WHEEL axis code
     const REL_WHEEL: u16 = 8;
     
@@ -496,6 +507,28 @@ fn remap_events(
                         out.push(InputEvent::new(EventType::RELATIVE, REL_WHEEL, scroll_value));
                     }
                     return Some(out);
+                }
+                
+                // Handle macro target codes
+                if target.base > MACRO_CODE_BASE && target.base < 2000 {
+                    let macro_id = (target.base - MACRO_CODE_BASE) as u32;
+                    // Only trigger on key press (value=1), not release
+                    if value == 1 {
+                        info!("MACRO: triggering macro id={}", macro_id);
+                        if let Some(macro_data) = macros.get(&macro_id) {
+                            // Execute macro in a background thread to avoid blocking input
+                            let macro_clone = macro_data.clone();
+                            std::thread::spawn(move || {
+                                if let Err(e) = crate::macro_engine::execute_macro(&macro_clone) {
+                                    warn!("Macro execution failed: {}", e);
+                                }
+                            });
+                        } else {
+                            warn!("Macro id={} not found in remapper's macro cache", macro_id);
+                        }
+                    }
+                    // Don't emit any key events for macros
+                    return Some(vec![]);
                 }
 
                 match value {

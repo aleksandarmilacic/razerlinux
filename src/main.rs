@@ -5,6 +5,7 @@
 
 mod device;
 mod hidpoll;
+mod macro_engine;
 mod overlay;
 mod profile;
 mod protocol;
@@ -60,12 +61,15 @@ fn main() -> Result<()> {
     
     // DPI button poller - polls hidraw for DPI button presses and injects F13/F14 events
     let dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>> = Rc::new(RefCell::new(None));
+    
+    // Macro manager for recording and playback
+    let macro_manager: Rc<RefCell<macro_engine::MacroManager>> = Rc::new(RefCell::new(macro_engine::MacroManager::new()));
 
     // Try to find and connect to device on startup
     connect_device(&main_window, &device);
 
     // Setup callbacks
-    setup_callbacks(&main_window, device, remapper, remap_mappings, dpi_poller, autoscroll_enabled, autoscroll_overlay);
+    setup_callbacks(&main_window, device, remapper, remap_mappings, dpi_poller, autoscroll_enabled, autoscroll_overlay, macro_manager);
 
     // Run the GUI event loop
     info!("Starting GUI...");
@@ -158,6 +162,7 @@ fn setup_callbacks(
     dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
     autoscroll_enabled: Rc<RefCell<bool>>,
     autoscroll_overlay: Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
+    macro_manager: Rc<RefCell<macro_engine::MacroManager>>,
 ) {
     // Apply DPI callback
     let device_clone = device.clone();
@@ -202,6 +207,7 @@ fn setup_callbacks(
     // Save profile callback
     let remap_mappings_clone = remap_mappings.clone();
     let remapper_clone = remapper.clone();
+    let macro_mgr_clone = macro_manager.clone();
     let window_weak = window.as_weak();
     window.on_save_profile(move |profile_name| {
         info!("Saving profile: {}", profile_name);
@@ -229,6 +235,9 @@ fn setup_callbacks(
                     macro_id: None,
                 })
                 .collect();
+                
+            // Include macros in the profile
+            profile.macros = macro_mgr_clone.borrow().export_for_profile();
 
             // If remapping is currently active, store the detected/selected device if any.
             if profile.remap.enabled {
@@ -258,6 +267,7 @@ fn setup_callbacks(
     let dpi_poller_clone = dpi_poller.clone();
     let autoscroll_clone = autoscroll_enabled.clone();
     let overlay_clone = autoscroll_overlay.clone();
+    let macro_mgr_clone = macro_manager.clone();
     let window_weak = window.as_weak();
     window.on_load_profile(move |profile_name| {
         info!("Loading profile: {}", profile_name);
@@ -304,11 +314,19 @@ fn setup_callbacks(
                             }
                             win.set_remap_enabled(profile.remap.enabled);
                             update_remap_summary(&win, &remap_mappings_clone.borrow());
+                            
+                            // Load macros from profile
+                            {
+                                let mut mgr = macro_mgr_clone.borrow_mut();
+                                mgr.load_from_profile(profile.macros.clone());
+                                win.set_macro_list_text(mgr.get_macros_list_text().into());
+                                win.set_available_macros(mgr.get_available_macros_string().into());
+                            }
 
                             // Start/stop remapper to match profile
                             if profile.remap.enabled {
                                 let autoscroll = *autoscroll_clone.borrow();
-                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll);
+                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll, &macro_mgr_clone);
                             } else {
                                 stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                             }
@@ -331,11 +349,12 @@ fn setup_callbacks(
     let dpi_poller_clone = dpi_poller.clone();
     let autoscroll_clone = autoscroll_enabled.clone();
     let overlay_clone = autoscroll_overlay.clone();
+    let macro_mgr_clone = macro_manager.clone();
     window.on_remap_set_enabled(move |enabled| {
         if let Some(win) = window_weak.upgrade() {
             if enabled {
                 let autoscroll = *autoscroll_clone.borrow();
-                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll);
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll, &macro_mgr_clone);
             } else {
                 stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                 win.set_status_message("Remapping disabled".into());
@@ -351,6 +370,7 @@ fn setup_callbacks(
     let remap_mappings_clone = remap_mappings.clone();
     let dpi_poller_clone = dpi_poller.clone();
     let overlay_clone = autoscroll_overlay.clone();
+    let macro_mgr_clone = macro_manager.clone();
     window.on_autoscroll_set_enabled(move |enabled| {
         info!("Autoscroll set to: {}", enabled);
         *autoscroll_clone.borrow_mut() = enabled;
@@ -362,7 +382,7 @@ fn setup_callbacks(
                 stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                 // Give time for devices to be properly ungrabbed
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, enabled);
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, enabled, &macro_mgr_clone);
             }
         }
     });
@@ -472,6 +492,26 @@ fn setup_callbacks(
             );
         }
     });
+    
+    // Add macro mapping (special handling for target codes 1000+)
+    let window_weak = window.as_weak();
+    let remap_mappings_clone = remap_mappings.clone();
+    window.on_remap_add_macro_mapping(move |source, macro_id| {
+        if let Some(win) = window_weak.upgrade() {
+            let s = source as u16;
+            // Store macro ID as target code (1000 + macro_id)
+            let target_code = (1000 + macro_id) as u16;
+            remap_mappings_clone.borrow_mut().insert(
+                s,
+                remap::MappingTarget {
+                    base: target_code,
+                    mods: remap::Modifiers::default(),
+                },
+            );
+            update_remap_summary(&win, &remap_mappings_clone.borrow());
+            win.set_status_message(format!("Mapped button {} -> Macro {}", s, macro_id).into());
+        }
+    });
 
     // Clear mappings
     let window_weak = window.as_weak();
@@ -500,7 +540,7 @@ fn setup_callbacks(
     });
     
     // =====================
-    // Macro Callbacks (stubs for now)
+    // Macro Callbacks
     // =====================
     
     let window_weak = window.as_weak();
@@ -510,28 +550,48 @@ fn setup_callbacks(
             win.set_current_macro_name("".into());
             win.set_macro_actions_text("No actions".into());
             win.set_selected_macro_id(0);
-            win.set_status_message("Creating new macro...".into());
+            win.set_status_message("Creating new macro - enter name and start recording".into());
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_edit_macro(move |macro_id| {
         if let Some(win) = window_weak.upgrade() {
             info!("Edit macro {} requested", macro_id);
-            win.set_status_message(format!("Editing macro {}", macro_id).into());
+            let mgr = macro_mgr.borrow();
+            if let Some(m) = mgr.get_macro(macro_id as u32) {
+                win.set_selected_macro_id(macro_id);
+                win.set_current_macro_name(m.name.clone().into());
+                win.set_macro_actions_text(m.to_display_text().into());
+                win.set_status_message(format!("Editing macro '{}'", m.name).into());
+            } else {
+                win.set_status_message(format!("Macro {} not found", macro_id).into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_delete_macro(move |macro_id| {
         if let Some(win) = window_weak.upgrade() {
             info!("Delete macro {} requested", macro_id);
-            win.set_status_message(format!("Deleted macro {}", macro_id).into());
-            win.set_macro_list_text("No macros defined".into());
+            let mut mgr = macro_mgr.borrow_mut();
+            if mgr.delete_macro(macro_id as u32) {
+                win.set_macro_list_text(mgr.get_macros_list_text().into());
+                win.set_available_macros(mgr.get_available_macros_string().into());
+                win.set_current_macro_name("".into());
+                win.set_macro_actions_text("No actions".into());
+                win.set_selected_macro_id(0);
+                win.set_status_message(format!("Deleted macro {}", macro_id).into());
+            } else {
+                win.set_status_message(format!("Macro {} not found", macro_id).into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_save_macro(move |name, repeat| {
         if let Some(win) = window_weak.upgrade() {
             info!("Save macro '{}' with repeat={}", name, repeat);
@@ -539,61 +599,129 @@ fn setup_callbacks(
                 win.set_status_message("Please enter a macro name".into());
                 return;
             }
-            win.set_status_message(format!("Saved macro '{}'", name).into());
-            // TODO: Actually save to profile
+            
+            let mut mgr = macro_mgr.borrow_mut();
+            let selected_id = win.get_selected_macro_id();
+            
+            if selected_id > 0 {
+                // Update existing macro
+                mgr.update_macro(selected_id as u32, &name, repeat as u32);
+                win.set_status_message(format!("Updated macro '{}'", name).into());
+            } else {
+                // Create new macro (recording should have been done already)
+                let id = mgr.get_next_id();
+                let m = profile::Macro::new(id, name.to_string());
+                mgr.save_macro(m);
+                win.set_selected_macro_id(id as i32);
+                win.set_status_message(format!("Created macro (id={})", id).into());
+            }
+            
+            win.set_macro_list_text(mgr.get_macros_list_text().into());
+            win.set_available_macros(mgr.get_available_macros_string().into());
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_start_macro_recording(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Macro recording started");
+            let mut mgr = macro_mgr.borrow_mut();
+            let name = win.get_current_macro_name().to_string();
+            let macro_name = if name.is_empty() { "Untitled" } else { &name };
+            
+            mgr.start_recording(macro_name);
             win.set_macro_recording(true);
-            win.set_status_message("Recording macro... press keys to record".into());
-            win.set_macro_actions_text("Recording...".into());
+            win.set_status_message("Recording macro... press keys in another window".into());
+            win.set_macro_actions_text("Recording in progress...\nPress buttons to record actions".into());
+            info!("Macro recording started for '{}'", macro_name);
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_stop_macro_recording(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Macro recording stopped");
-            win.set_macro_recording(false);
-            win.set_status_message("Recording stopped".into());
+            let mut mgr = macro_mgr.borrow_mut();
+            
+            if let Some(recorded_macro) = mgr.stop_recording() {
+                win.set_macro_recording(false);
+                win.set_selected_macro_id(recorded_macro.id as i32);
+                win.set_current_macro_name(recorded_macro.name.clone().into());
+                win.set_macro_actions_text(recorded_macro.to_display_text().into());
+                win.set_macro_list_text(mgr.get_macros_list_text().into());
+                win.set_available_macros(mgr.get_available_macros_string().into());
+                win.set_status_message(format!("Recorded {} actions", recorded_macro.actions.len()).into());
+            } else {
+                win.set_macro_recording(false);
+                win.set_status_message("No recording in progress".into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_add_macro_keypress(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Add keypress to macro");
-            win.set_status_message("Click a key to add to macro...".into());
-            // TODO: Implement key capture
+            let mgr = macro_mgr.borrow();
+            if mgr.is_recording() {
+                win.set_status_message("Recording: press a key...".into());
+                // Keys are captured automatically during recording
+            } else {
+                win.set_status_message("Start recording first to add keypresses".into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_add_macro_delay(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Add delay to macro");
-            // Add a default 100ms delay
-            let current = win.get_macro_actions_text().to_string();
-            let new_text = if current == "No actions" || current == "Recording..." {
-                "⏱ 100ms".to_string()
+            let mut mgr = macro_mgr.borrow_mut();
+            if mgr.is_recording() {
+                mgr.add_delay(100);
+                win.set_macro_actions_text(mgr.get_recording_display_text().into());
+                win.set_status_message("Added 100ms delay".into());
             } else {
-                format!("{}\n⏱ 100ms", current)
-            };
-            win.set_macro_actions_text(new_text.into());
-            win.set_status_message("Added 100ms delay".into());
+                // Add delay to selected macro's display (visual only until save)
+                let current = win.get_macro_actions_text().to_string();
+                let new_text = if current == "No actions" {
+                    "⏱ 100ms".to_string()
+                } else {
+                    format!("{}\n⏱ 100ms", current)
+                };
+                win.set_macro_actions_text(new_text.into());
+                win.set_status_message("Added 100ms delay (save to apply)".into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_test_macro(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Test macro requested");
-            win.set_status_message("Testing macro... (not implemented yet)".into());
-            // TODO: Actually execute the macro via uinput
+            let selected_id = win.get_selected_macro_id();
+            if selected_id <= 0 {
+                win.set_status_message("No macro selected".into());
+                return;
+            }
+            
+            let mgr = macro_mgr.borrow();
+            if let Some(m) = mgr.get_macro(selected_id as u32) {
+                let macro_clone = m.clone();
+                drop(mgr); // Release borrow before spawning thread
+                
+                info!("Testing macro '{}' with {} actions", macro_clone.name, macro_clone.actions.len());
+                win.set_status_message(format!("Testing macro '{}'...", macro_clone.name).into());
+                
+                // Execute in background thread
+                std::thread::spawn(move || {
+                    if let Err(e) = macro_engine::execute_macro(&macro_clone) {
+                        error!("Macro execution failed: {}", e);
+                    }
+                });
+            } else {
+                win.set_status_message("Macro not found".into());
+            }
         }
     });
 }
@@ -606,6 +734,7 @@ fn start_remapper(
     dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
     autoscroll_overlay: &Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
     autoscroll_enabled: bool,
+    macro_manager: &Rc<RefCell<macro_engine::MacroManager>>,
 ) {
     if remapper.borrow().is_some() {
         win.set_status_message("Remapping already enabled".into());
@@ -668,7 +797,18 @@ fn start_remapper(
         None
     };
 
-    match remap::Remapper::start(config, overlay_sender) {
+    // Clone macros for the remapper thread
+    // Note: Macros are cloned at remapper start time. If macros are edited while
+    // remapper is running, the remapper won't see the changes until restart.
+    let macros_for_remapper: std::collections::HashMap<u32, profile::Macro> = {
+        let mgr = macro_manager.borrow();
+        mgr.export_for_profile()
+            .into_iter()
+            .map(|m| (m.id, m))
+            .collect()
+    };
+
+    match remap::Remapper::start(config, overlay_sender, macros_for_remapper) {
         Ok(r) => {
             *remapper.borrow_mut() = Some(r);
             win.set_status_message("Remapping enabled (virtual device active)".into());
@@ -831,6 +971,8 @@ fn format_mapping_target(t: &remap::MappingTarget) -> String {
 fn key_name(code: u16) -> Option<String> {
     // Common, user-friendly labels for typical keyboard codes
     match code {
+        // Macro IDs are 1000+
+        1001..=1999 => Some(format!("Macro {}", code - 1000)),
         2..=11 => Some(format!("{}", code_to_digit(code)?)),
         59 => Some("F1".into()),
         60 => Some("F2".into()),

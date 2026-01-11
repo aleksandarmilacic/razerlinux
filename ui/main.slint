@@ -134,6 +134,9 @@ export component MainWindow inherits Window {
     in-out property <string> current-macro-name: "";
     in-out property <int> selected-macro-id: 0;
     in-out property <bool> macro-recording: false;
+    
+    // Macro list for button assignment dropdown (format: "id1:name1,id2:name2,...")
+    in-out property <string> available-macros: "";
 
     // Callbacks to Rust
     callback apply-dpi(int, int);
@@ -144,6 +147,7 @@ export component MainWindow inherits Window {
     callback autoscroll-set-enabled(bool);  // Toggle Windows-style autoscroll
     callback remap-learn-source();
     callback remap-add-mapping(int, int, bool, bool, bool, bool);
+    callback remap-add-macro-mapping(int, int);  // Map source button to macro ID
     callback remap-clear();
     callback remap-update-target-label(int, bool, bool, bool, bool);
     callback remap-remove-mapping(int);
@@ -702,6 +706,54 @@ export component MainWindow inherits Window {
                                     // Scroll wheel emulation (special codes handled by remapper)
                                     Button { text: "Scroll Up"; clicked => { remap-target-code = 280; remap-mod-ctrl = false; remap-mod-alt = false; remap-mod-shift = false; remap-mod-meta = false; remap-update-target-label(280, false, false, false, false); } }
                                     Button { text: "Scroll Down"; clicked => { remap-target-code = 281; remap-mod-ctrl = false; remap-mod-alt = false; remap-mod-shift = false; remap-mod-meta = false; remap-update-target-label(281, false, false, false, false); } }
+                                }
+                                
+                                // Macros section
+                                if available-macros != "" : VerticalLayout {
+                                    spacing: 6px;
+                                    Text { text: "📝 Macros"; color: #aaaaaa; font-weight: 600; }
+                                    Text { 
+                                        text: "Available: " + available-macros;
+                                        color: #888888;
+                                        font-size: 11px;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        // Special target code 1000+ indicates macro ID
+                                        Button { 
+                                            text: "▶ Assign Macro 1"; 
+                                            clicked => { 
+                                                remap-target-code = 1001; 
+                                                remap-mod-ctrl = false; 
+                                                remap-mod-alt = false; 
+                                                remap-mod-shift = false; 
+                                                remap-mod-meta = false; 
+                                                remap-update-target-label(1001, false, false, false, false); 
+                                            } 
+                                        }
+                                        Button { 
+                                            text: "▶ Assign Macro 2"; 
+                                            clicked => { 
+                                                remap-target-code = 1002; 
+                                                remap-mod-ctrl = false; 
+                                                remap-mod-alt = false; 
+                                                remap-mod-shift = false; 
+                                                remap-mod-meta = false; 
+                                                remap-update-target-label(1002, false, false, false, false); 
+                                            } 
+                                        }
+                                        Button { 
+                                            text: "▶ Assign Macro 3"; 
+                                            clicked => { 
+                                                remap-target-code = 1003; 
+                                                remap-mod-ctrl = false; 
+                                                remap-mod-alt = false; 
+                                                remap-mod-shift = false; 
+                                                remap-mod-meta = false; 
+                                                remap-update-target-label(1003, false, false, false, false); 
+                                            } 
+                                        }
+                                    }
                                 }
                                 
                                 // Modifiers

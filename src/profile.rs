@@ -32,6 +32,10 @@ pub struct Profile {
     /// Software remapping settings (evdev/uinput)
     #[serde(default)]
     pub remap: RemapSettings,
+    
+    /// Macro definitions
+    #[serde(default)]
+    pub macros: Vec<Macro>,
 }
 
 fn default_polling_rate() -> u16 {
@@ -71,6 +75,7 @@ impl Default for Profile {
             polling_rate: 1000,
             brightness: 255,
             remap: RemapSettings::default(),
+            macros: Vec::new(),
         }
     }
 }
@@ -97,6 +102,7 @@ impl Profile {
             polling_rate: 1000,
             brightness: 255,
             remap: RemapSettings::default(),
+            macros: Vec::new(),
         }
     }
 }
