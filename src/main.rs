@@ -4,6 +4,7 @@
 //! without requiring kernel drivers.
 
 mod device;
+mod hidpoll;
 mod profile;
 mod protocol;
 mod remap;
@@ -49,12 +50,15 @@ fn main() -> Result<()> {
     let remapper: Rc<RefCell<Option<remap::Remapper>>> = Rc::new(RefCell::new(None));
     let remap_mappings: Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>> =
         Rc::new(RefCell::new(BTreeMap::new()));
+    
+    // DPI button poller - polls hidraw for DPI button presses and injects F13/F14 events
+    let dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>> = Rc::new(RefCell::new(None));
 
     // Try to find and connect to device on startup
     connect_device(&main_window, &device);
 
     // Setup callbacks
-    setup_callbacks(&main_window, device, remapper, remap_mappings);
+    setup_callbacks(&main_window, device, remapper, remap_mappings, dpi_poller);
 
     // Run the GUI event loop
     info!("Starting GUI...");
@@ -144,6 +148,7 @@ fn setup_callbacks(
     device: Rc<RefCell<Option<device::RazerDevice>>>,
     remapper: Rc<RefCell<Option<remap::Remapper>>>,
     remap_mappings: Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+    dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
 ) {
     // Apply DPI callback
     let device_clone = device.clone();
@@ -240,6 +245,7 @@ fn setup_callbacks(
     let device_clone = device.clone();
     let remap_mappings_clone = remap_mappings.clone();
     let remapper_clone = remapper.clone();
+    let dpi_poller_clone = dpi_poller.clone();
     let window_weak = window.as_weak();
     window.on_load_profile(move |profile_name| {
         info!("Loading profile: {}", profile_name);
@@ -289,9 +295,9 @@ fn setup_callbacks(
 
                             // Start/stop remapper to match profile
                             if profile.remap.enabled {
-                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone);
+                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone);
                             } else {
-                                stop_remapper(&device_clone, &remapper_clone);
+                                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone);
                             }
 
                             win.set_status_message(format!("Profile '{}' loaded!", name).into());
@@ -309,12 +315,13 @@ fn setup_callbacks(
     let device_clone = device.clone();
     let remapper_clone = remapper.clone();
     let remap_mappings_clone = remap_mappings.clone();
+    let dpi_poller_clone = dpi_poller.clone();
     window.on_remap_set_enabled(move |enabled| {
         if let Some(win) = window_weak.upgrade() {
             if enabled {
-                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone);
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone);
             } else {
-                stop_remapper(&device_clone, &remapper_clone);
+                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone);
                 win.set_status_message("Remapping disabled".into());
             }
         }
@@ -458,6 +465,7 @@ fn start_remapper(
     device: &Rc<RefCell<Option<device::RazerDevice>>>,
     remapper: &Rc<RefCell<Option<remap::Remapper>>>,
     mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+    dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
 ) {
     if remapper.borrow().is_some() {
         win.set_status_message("Remapping already enabled".into());
@@ -485,6 +493,22 @@ fn start_remapper(
         mappings: mappings.borrow().clone(),
     };
 
+    // Start the DPI button poller FIRST so its virtual device exists
+    // when the remapper enumerates devices
+    if dpi_poller.borrow().is_none() {
+        match hidpoll::DpiButtonPoller::start() {
+            Ok(poller) => {
+                info!("DPI button poller started");
+                *dpi_poller.borrow_mut() = Some(poller);
+                // Brief delay to let uinput device be created
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                warn!("Failed to start DPI poller: {} - DPI buttons won't be remappable", e);
+            }
+        }
+    }
+
     match remap::Remapper::start(config) {
         Ok(r) => {
             *remapper.borrow_mut() = Some(r);
@@ -495,6 +519,10 @@ fn start_remapper(
             if let Some(ref mut dev) = *device.borrow_mut() {
                 let _ = dev.disable_driver_mode();
             }
+            // Also stop DPI poller if remapper fails
+            if let Some(poller) = dpi_poller.borrow_mut().take() {
+                poller.stop();
+            }
             win.set_remap_enabled(false);
             win.set_status_message(format!("Remap start failed: {e}").into());
         }
@@ -504,9 +532,16 @@ fn start_remapper(
 fn stop_remapper(
     device: &Rc<RefCell<Option<device::RazerDevice>>>,
     remapper: &Rc<RefCell<Option<remap::Remapper>>>,
+    dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
 ) {
     if let Some(r) = remapper.borrow_mut().take() {
         r.stop();
+    }
+    
+    // Stop the DPI button poller
+    if let Some(p) = dpi_poller.borrow_mut().take() {
+        p.stop();
+        info!("DPI button poller stopped");
     }
 
     // Disable Driver Mode - restore normal operation
@@ -554,9 +589,14 @@ fn update_button_mapping_labels(win: &MainWindow, mappings: &BTreeMap<u16, remap
     win.set_btn11_mapping(get_mapping(12).into()); // KEY_MINUS
     win.set_btn12_mapping(get_mapping(13).into()); // KEY_EQUAL
     
-    // Thumb buttons
-    win.set_btn_back_mapping(get_mapping(275).into());    // BTN_SIDE (back)
-    win.set_btn_forward_mapping(get_mapping(276).into()); // BTN_EXTRA (forward)
+    // Mouse buttons (only 3 exist on Naga Trinity: MIDDLE, SIDE, EXTRA)
+    win.set_btn_middle_mapping(get_mapping(274).into());  // BTN_MIDDLE - scroll wheel click
+    win.set_btn_side_mapping(get_mapping(275).into());    // BTN_SIDE - thumb back
+    win.set_btn_extra_mapping(get_mapping(276).into());   // BTN_EXTRA - thumb forward
+    
+    // DPI buttons (captured via hidraw, injected as F13/F14)
+    win.set_btn_dpi_down_mapping(get_mapping(184).into()); // KEY_F14 - DPI Down
+    win.set_btn_dpi_up_mapping(get_mapping(183).into());   // KEY_F13 - DPI Up
 }
 
 fn update_remap_summary(win: &MainWindow, mappings: &BTreeMap<u16, remap::MappingTarget>) {
@@ -636,17 +676,25 @@ fn key_name(code: u16) -> Option<String> {
         70 => Some("F12".into()),
         28 => Some("Enter".into()),
         57 => Some("Space".into()),
+        // Navigation keys
+        102 => Some("Home".into()),
         103 => Some("Up".into()),
-        108 => Some("Down".into()),
+        104 => Some("Page Up".into()),
         105 => Some("Left".into()),
         106 => Some("Right".into()),
+        107 => Some("End".into()),
+        108 => Some("Down".into()),
+        109 => Some("Page Down".into()),
+        110 => Some("Insert".into()),
+        111 => Some("Delete".into()),
+        // Mouse buttons
         272 => Some("Left Click".into()),
         273 => Some("Right Click".into()),
         274 => Some("Middle Click".into()),
-        275 => Some("Back".into()),
-        276 => Some("Forward".into()),
-        277 => Some("BtnForward".into()),
-        278 => Some("BtnBack".into()),
+        275 => Some("Side (Back)".into()),
+        276 => Some("Extra (Fwd)".into()),
+        277 => Some("Forward".into()),
+        278 => Some("Back".into()),
         279 => Some("BtnTask".into()),
         280 => Some("Scroll Up".into()),
         281 => Some("Scroll Down".into()),

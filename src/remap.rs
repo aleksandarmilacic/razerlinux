@@ -177,7 +177,7 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, config: RemapConfig) -> Result<()> {
     // Open and grab all source devices
     let mut devices: Vec<Device> = Vec::new();
     let mut all_keys: AttributeSet<Key> = AttributeSet::new();
-    let mut all_rel: Option<AttributeSet<evdev::RelativeAxisType>> = None;
+    let mut all_rel: AttributeSet<evdev::RelativeAxisType> = AttributeSet::new();
     
     for source_path in &source_paths {
         let mut dev = Device::open(source_path)
@@ -192,32 +192,40 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, config: RemapConfig) -> Result<()> {
 
         // Collect key capabilities from all devices
         if let Some(src_keys) = dev.supported_keys() {
+            let key_count = src_keys.iter().count();
+            info!("  -> {} key capabilities", key_count);
             for k in src_keys.iter() {
                 all_keys.insert(k);
             }
         }
         
-        // Collect relative axis capabilities
+        // Collect relative axis capabilities from ALL devices (for scroll wheel, mouse movement)
         if let Some(rel) = dev.supported_relative_axes() {
-            if all_rel.is_none() {
-                let mut rel_set = AttributeSet::new();
-                for axis in rel.iter() {
-                    rel_set.insert(axis);
-                }
-                all_rel = Some(rel_set);
+            let axis_count = rel.iter().count();
+            info!("  -> {} relative axes (scroll wheel, mouse motion)", axis_count);
+            for axis in rel.iter() {
+                all_rel.insert(axis);
             }
         }
         
         devices.push(dev);
     }
     
-    // Add target keys to capabilities
+    // Add target keys to capabilities (except special scroll codes)
     for target in config.mappings.values() {
+        // Skip special scroll codes - they are REL events, not KEY events
+        if target.base == 280 || target.base == 281 {
+            continue;
+        }
         all_keys.insert(Key::new(target.base));
         for m in target.mods.to_key_codes() {
             all_keys.insert(Key::new(m));
         }
     }
+    
+    // Always add BTN_FORWARD and BTN_BACK in case they're used as targets
+    all_keys.insert(Key::BTN_FORWARD);
+    all_keys.insert(Key::BTN_BACK);
 
     // Build virtual device
     let mut vbuilder = VirtualDeviceBuilder::new().context("Failed to create uinput builder")?;
@@ -226,15 +234,22 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, config: RemapConfig) -> Result<()> {
     vbuilder = vbuilder
         .with_keys(&all_keys)
         .context("Failed to set key capabilities")?;
-    if let Some(ref rel) = all_rel {
+    
+    // Add relative axes if any were found (for scroll wheel, mouse movement)
+    let has_rel_axes = all_rel.iter().next().is_some();
+    if has_rel_axes {
+        info!("Virtual device will have relative axes (scroll wheel, mouse movement)");
         vbuilder = vbuilder
-            .with_relative_axes(rel)
+            .with_relative_axes(&all_rel)
             .context("Failed to set relative axis capabilities")?;
+    } else {
+        warn!("No relative axes found - scroll wheel may not work!");
     }
 
     let mut vdev = vbuilder.build().context("Failed to build uinput device")?;
     
     info!("Virtual device created, processing events from {} source(s)...", devices.len());
+    info!("Active mappings: {:?}", config.mappings);
 
     while !stop.load(Ordering::Relaxed) {
         let mut had_events = false;
@@ -244,6 +259,21 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, config: RemapConfig) -> Result<()> {
                 Ok(events) => {
                     for ev in events {
                         had_events = true;
+                        // Debug log events by type
+                        match ev.kind() {
+                            InputEventKind::Key(key) => {
+                                info!("KEY event: code={}, value={}", key.code(), ev.value());
+                            }
+                            InputEventKind::RelAxis(axis) => {
+                                info!("REL event: axis={:?}, value={}", axis, ev.value());
+                            }
+                            InputEventKind::Synchronization(_) => {
+                                // Don't log sync events (too noisy)
+                            }
+                            _ => {
+                                info!("OTHER event: type={:?}, code={}, value={}", ev.event_type(), ev.code(), ev.value());
+                            }
+                        }
                         if let Some(mapped_events) = remap_events(&config.mappings, ev) {
                             if let Err(e) = vdev.emit(&mapped_events) {
                                 warn!("uinput emit failed: {e}");
@@ -274,12 +304,30 @@ fn remap_events(
     mappings: &BTreeMap<u16, MappingTarget>,
     ev: InputEvent,
 ) -> Option<Vec<InputEvent>> {
+    // Special codes for scroll wheel emulation
+    const SCROLL_UP_CODE: u16 = 280;
+    const SCROLL_DOWN_CODE: u16 = 281;
+    // REL_WHEEL axis code
+    const REL_WHEEL: u16 = 8;
+    
     match ev.kind() {
         InputEventKind::Key(key) => {
             let src_code: u16 = key.code();
             let value = ev.value();
             if let Some(target) = mappings.get(&src_code) {
+                info!("REMAP: code {} -> {} (value={})", src_code, target.base, value);
                 let mut out: Vec<InputEvent> = Vec::new();
+
+                // Handle special scroll wheel emulation codes
+                if target.base == SCROLL_UP_CODE || target.base == SCROLL_DOWN_CODE {
+                    // Only emit scroll on key press (value=1), not release or repeat
+                    if value == 1 {
+                        let scroll_value = if target.base == SCROLL_UP_CODE { 1 } else { -1 };
+                        info!("SCROLL: emitting REL_WHEEL value={}", scroll_value);
+                        out.push(InputEvent::new(EventType::RELATIVE, REL_WHEEL, scroll_value));
+                    }
+                    return Some(out);
+                }
 
                 match value {
                     1 => {
@@ -445,14 +493,16 @@ fn select_all_razer_keyboard_devices(preferred_device: &Option<String>) -> Vec<P
 
     let mut razer_devices: Vec<PathBuf> = Vec::new();
     
-    info!("Scanning for ALL Razer interfaces to grab (keyboard + mouse)...");
+    info!("Scanning for ALL Razer interfaces to grab (keyboard + mouse + DPI)...");
     
     for (path, dev) in evdev::enumerate() {
         let name = dev.name().unwrap_or_default().to_string();
         let name_lower = name.to_ascii_lowercase();
 
         let is_razer = name_lower.contains("razer") || name_lower.contains("naga");
-        if !is_razer {
+        let is_dpi_device = name.contains("RazerLinux DPI");
+        
+        if !is_razer && !is_dpi_device {
             continue;
         }
         
@@ -469,8 +519,13 @@ fn select_all_razer_keyboard_devices(preferred_device: &Option<String>) -> Vec<P
             k.contains(Key::BTN_FORWARD) || k.contains(Key::BTN_BACK)
         }).unwrap_or(false);
         
+        // Grab the DPI button virtual device (it has F13/F14 keys)
+        if is_dpi_device {
+            info!("  Found DPI button virtual device: {:?}", path);
+            razer_devices.push(path);
+        }
         // Grab interfaces that have keyboard keys OR mouse thumb buttons
-        if num_keys > 0 {
+        else if num_keys > 0 {
             info!("  Found Razer keyboard interface: {:?} [keys={}]", path, num_keys);
             razer_devices.push(path);
         } else if has_mouse_btns {
