@@ -107,6 +107,10 @@ pub struct RemapSettings {
     /// Whether remapping should be enabled
     #[serde(default)]
     pub enabled: bool,
+    
+    /// Whether Windows-style autoscroll is enabled
+    #[serde(default)]
+    pub autoscroll: bool,
 
     /// Optional evdev path like /dev/input/eventX
     #[serde(default)]
@@ -115,6 +119,10 @@ pub struct RemapSettings {
     /// Key/button code mappings (Linux input codes)
     #[serde(default)]
     pub mappings: Vec<RemapMapping>,
+    
+    /// User-defined macros
+    #[serde(default)]
+    pub macros: Vec<Macro>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +139,118 @@ pub struct RemapMapping {
         pub shift: bool,
         #[serde(default)]
         pub meta: bool,
+        /// Optional macro ID (if target is a macro instead of a key)
+        #[serde(default)]
+        pub macro_id: Option<u32>,
+}
+
+/// A macro action (single step in a macro)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MacroAction {
+    /// Type of action
+    pub action_type: MacroActionType,
+    /// Key code for key actions
+    #[serde(default)]
+    pub key_code: Option<u16>,
+    /// Delay in milliseconds for delay actions
+    #[serde(default)]
+    pub delay_ms: Option<u32>,
+}
+
+/// Type of macro action
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MacroActionType {
+    /// Press a key (key down)
+    KeyPress,
+    /// Release a key (key up)
+    KeyRelease,
+    /// Wait for a duration
+    Delay,
+    /// Click a mouse button
+    MouseClick,
+}
+
+/// A complete macro definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Macro {
+    /// Unique identifier
+    pub id: u32,
+    /// Human-readable name
+    pub name: String,
+    /// Sequence of actions
+    pub actions: Vec<MacroAction>,
+    /// Number of times to repeat (0 = while button held)
+    #[serde(default = "default_repeat_count")]
+    pub repeat_count: u32,
+    /// Delay between repeats in milliseconds
+    #[serde(default = "default_repeat_delay")]
+    pub repeat_delay_ms: u32,
+}
+
+fn default_repeat_count() -> u32 {
+    1
+}
+
+fn default_repeat_delay() -> u32 {
+    50
+}
+
+impl Macro {
+    /// Create a new empty macro with the given name
+    pub fn new(id: u32, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            actions: Vec::new(),
+            repeat_count: 1,
+            repeat_delay_ms: 50,
+        }
+    }
+    
+    /// Add a key press action
+    pub fn add_key_press(&mut self, key_code: u16) {
+        self.actions.push(MacroAction {
+            action_type: MacroActionType::KeyPress,
+            key_code: Some(key_code),
+            delay_ms: None,
+        });
+    }
+    
+    /// Add a key release action
+    pub fn add_key_release(&mut self, key_code: u16) {
+        self.actions.push(MacroAction {
+            action_type: MacroActionType::KeyRelease,
+            key_code: Some(key_code),
+            delay_ms: None,
+        });
+    }
+    
+    /// Add a delay action
+    pub fn add_delay(&mut self, delay_ms: u32) {
+        self.actions.push(MacroAction {
+            action_type: MacroActionType::Delay,
+            key_code: None,
+            delay_ms: Some(delay_ms),
+        });
+    }
+    
+    /// Format as human-readable text for display
+    pub fn to_display_text(&self) -> String {
+        if self.actions.is_empty() {
+            return "No actions".to_string();
+        }
+        
+        self.actions
+            .iter()
+            .map(|a| match a.action_type {
+                MacroActionType::KeyPress => format!("↓ KEY_{}", a.key_code.unwrap_or(0)),
+                MacroActionType::KeyRelease => format!("↑ KEY_{}", a.key_code.unwrap_or(0)),
+                MacroActionType::Delay => format!("⏱ {}ms", a.delay_ms.unwrap_or(0)),
+                MacroActionType::MouseClick => format!("🖱 BTN_{}", a.key_code.unwrap_or(0)),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// Profile manager for saving/loading profiles

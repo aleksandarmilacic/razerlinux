@@ -11,15 +11,56 @@ A complete end-to-end solution for configuring and mapping Razer mice on Linux s
 - Persist settings across reboots
 
 ### Current Status (Jan 2026)
-- Userspace HID working for Naga Trinity (DPI read/write, firmware)
-- Slint GUI shipped
-- TOML profiles stored under `~/.config/razerlinux/profiles/`
-- Software remapping via evdev/uinput implemented (key + Ctrl/Alt/Shift/Meta combos)
+
+#### Completed Features
+- ✅ Userspace HID working for Naga Trinity (DPI read/write, firmware, device mode switching)
+- ✅ Slint GUI shipped with modern Qt-like styling
+- ✅ TOML profiles stored under `~/.config/razerlinux/profiles/`
+- ✅ Software remapping via evdev/uinput (key + Ctrl/Alt/Shift/Meta combos)
+- ✅ Driver Mode switching (side buttons send KEY_1-KEY_12 automatically)
+- ✅ Background DPI polling with real-time UI updates
+- ✅ **Windows-Style Middle-Click Autoscroll** with visual overlay:
+  - X11 overlay window with directional arrows
+  - XShape extension for click-through (doesn't interfere with input)
+  - Distance-based scroll speed (further from anchor = faster)
+  - Throttled overlay updates to prevent X11 flooding
+  - Free cursor movement during autoscroll
+
+#### Technical Implementation Details
+
+**Autoscroll Architecture:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     remap.rs (Remapper)                      │
+│  - Captures middle-click to enter autoscroll mode            │
+│  - Tracks cursor position relative to anchor point           │
+│  - Emits scroll events every 5 mouse events                  │
+│  - Scroll speed = distance / 50 (with 20px threshold)        │
+│  - Sends UpdateDirection to overlay every 20 events          │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ mpsc channel (OverlayCommand)
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   overlay.rs (X11 Overlay)                   │
+│  - 48x48px override_redirect window                          │
+│  - XShape extension sets empty input region (click-through)  │
+│  - Draws directional arrows based on scroll direction        │
+│  - Throttled redraws (only if direction changed >0.2)        │
+│  - Commands: Show, Hide, UpdateDirection(dx,dy), Shutdown    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Constants (remap.rs):**
+- `SCROLL_THRESHOLD = 20` - Pixels before scrolling starts
+- `SCROLL_SPEED_DIVISOR = 50` - Higher = slower scroll
+- `SCROLL_TICK_INTERVAL = 5` - Emit scroll every N mouse events
+- `DIRECTION_UPDATE_INTERVAL = 20` - Update overlay every N events
 
 ### Next Up
 - Remap UX presets (numbers/F-keys/arrows), target capture, and per-panel defaults (2/7/12 buttons)
 - Auto-detect side panel / button count from evdev name/capabilities and prefill mappings
 - RGB lighting control
+- Wayland overlay support (currently X11 only)
 - Packaging (RPM/DEB/AppImage) and tray/autostart
 
 ---
@@ -148,6 +189,8 @@ sudo udevadm trigger
 - [x] DPI adjustment (100-16,000 in steps)
 - [ ] Polling rate (125/500/1000 Hz)
 - [x] Software button remapping (key + modifier combos via evdev/uinput)
+- [x] Driver Mode switching (side buttons send keyboard keys)
+- [x] Windows-style middle-click autoscroll with visual overlay
 - [ ] Side panel auto-detection and per-panel defaults (2/7/12)
 - [ ] RGB scroll wheel + logo lighting
 - [ ] On-board profile storage (if supported)
@@ -159,34 +202,45 @@ sudo udevadm trigger
 ### System Components (Userspace Approach - No Kernel Driver!)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      GUI Application                         │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐ │
-│  │ Device Panel │ │ Button Panel │ │ Lighting/DPI Panel   │ │
-│  └──────────────┘ └──────────────┘ └──────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Core Service/Daemon                       │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐ │
-│  │ Device Mgr   │ │ Profile Mgr  │ │ Input Remapper       │ │
-│  └──────────────┘ └──────────────┘ └──────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-                              │
-            ┌─────────────────┼─────────────────┐
-            ▼                 ▼                 ▼
-     ┌─────────────┐  ┌─────────────────┐  ┌─────────────┐
-     │ hidapi      │  │ uinput/evdev    │  │ Config      │
-     │ (USB HID)   │  │ (Input Layer)   │  │ Storage     │
-     └─────────────┘  └─────────────────┘  └─────────────┘
-            │
-            ▼
-     ┌─────────────┐
-     │ USB Device  │
-     │ Naga Trinity│
-     └─────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        GUI Application (Slint)                       │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌─────────────┐ │
+│  │ Device Panel │ │ DPI Panel    │ │ Remap Panel  │ │ Profile Mgr │ │
+│  └──────────────┘ └──────────────┘ └──────────────┘ └─────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+┌───────────────┐         ┌─────────────────────┐       ┌─────────────┐
+│  device.rs    │         │     remap.rs        │       │ profile.rs  │
+│  - DPI R/W    │         │  - evdev grab       │       │ - TOML save │
+│  - Mode switch│         │  - uinput emit      │       │ - TOML load │
+│  - Firmware   │         │  - Autoscroll logic │       │ - Mappings  │
+└───────┬───────┘         └──────────┬──────────┘       └─────────────┘
+        │                            │
+        ▼                            │ mpsc channel
+┌───────────────┐                    ▼
+│   hidapi      │         ┌─────────────────────┐
+│   (USB HID)   │         │    overlay.rs       │
+└───────┬───────┘         │  - X11 window       │
+        │                 │  - XShape click-thru│
+        ▼                 │  - Direction arrows │
+┌───────────────┐         └─────────────────────┘
+│  USB Device   │
+│  Naga Trinity │
+└───────────────┘
 ```
+
+**Source Files:**
+| File | Purpose |
+|------|---------|
+| `main.rs` | GUI setup, callbacks, lifecycle management |
+| `device.rs` | USB HID communication (DPI, mode switching, firmware) |
+| `protocol.rs` | Razer 90-byte report structure, CRC calculation |
+| `profile.rs` | TOML profile save/load in `~/.config/razerlinux/profiles/` |
+| `remap.rs` | evdev capture, uinput virtual device, autoscroll state machine |
+| `overlay.rs` | X11 autoscroll overlay with XShape for click-through |
+| `hidpoll.rs` | Background HID polling for real-time DPI updates |
 
 ### Why Userspace (No OpenRazer)?
 
@@ -450,42 +504,121 @@ sudo zypper install qt6-base-devel qt6-declarative-devel cmake
 
 ## Implementation Phases
 
-### Phase 1: Foundation (MVP) - Naga Trinity Focus
-- [ ] Set up project structure
-- [ ] Implement USB HID device detection (hidapi)
-- [ ] Send/receive basic commands to Naga Trinity
-- [ ] Basic GUI with device info display
-- [ ] Read current DPI settings
-- [ ] Set DPI via GUI
+### Phase 1: Foundation (MVP) - Naga Trinity Focus ✅ COMPLETE
+- [x] Set up project structure
+- [x] Implement USB HID device detection (hidapi)
+- [x] Send/receive basic commands to Naga Trinity
+- [x] Basic GUI with device info display (Slint)
+- [x] Read current DPI settings
+- [x] Set DPI via GUI
+- [x] Background DPI polling for real-time updates
 
-### Phase 2: Button Mapping
-- [ ] Capture button events via evdev
-- [ ] Create virtual input device (uinput)
-- [ ] Map side buttons to keyboard keys
-- [ ] Map buttons to other mouse buttons
-- [ ] Side panel detection (2/7/12 button modes)
-- [ ] Save/load button mappings
+### Phase 2: Button Mapping ✅ COMPLETE
+- [x] Capture button events via evdev
+- [x] Create virtual input device (uinput)
+- [x] Map side buttons to keyboard keys
+- [x] Map buttons with modifier combos (Ctrl/Alt/Shift/Meta)
+- [x] Driver Mode switching (side buttons send KEY_1-12)
+- [x] Save/load button mappings
+- [x] **Windows-style middle-click autoscroll with visual overlay**
+- [ ] Side panel auto-detection (2/7/12 button modes) - PENDING
+- [ ] Button learning UX improvements (target capture) - PENDING
 
-### Phase 3: Profiles
-- [ ] Profile data structure
-- [ ] Profile storage (JSON)
-- [ ] Profile switching UI
-- [ ] Default profile on startup
-- [ ] Systemd user service for persistence
+### Phase 3: Profiles ✅ COMPLETE
+- [x] Profile data structure
+- [x] Profile storage (TOML format)
+- [x] Profile switching UI
+- [x] Default profile on startup
+- [ ] Systemd user service for persistence - PENDING
 
-### Phase 4: Advanced Features
+### Phase 4: Advanced Features 🔄 IN PROGRESS
 - [ ] Macro recording/playback
 - [ ] RGB scroll wheel + logo control
 - [ ] Polling rate configuration
 - [ ] System tray daemon
 - [ ] Per-application profiles (optional)
+- [ ] Wayland overlay support (currently X11 only)
 
-### Phase 5: Polish & Distribution
+#### Macro System Design (Phase 4 Priority)
+
+**Macro Data Structure:**
+```rust
+struct MacroAction {
+    action_type: MacroActionType,  // KeyPress, KeyRelease, Delay, MouseClick
+    key_code: Option<u16>,         // For key actions
+    delay_ms: Option<u32>,         // For delay actions
+}
+
+enum MacroActionType {
+    KeyPress,      // Press a key
+    KeyRelease,    // Release a key
+    Delay,         // Wait N milliseconds
+    MouseClick,    // Click mouse button
+}
+
+struct Macro {
+    id: u32,
+    name: String,
+    actions: Vec<MacroAction>,
+    repeat_count: u32,        // 0 = infinite while held
+    repeat_delay_ms: u32,     // Delay between repeats
+}
+```
+
+**Macro Builder UI (📝 Macros Tab):**
+- List of saved macros with Add/Edit/Delete
+- Recording mode: capture keystrokes in real-time
+- Manual mode: add actions one by one
+- Delay insertion between actions
+- Preview/test macro before saving
+- Assign macro to button (link to Button Mapping tab)
+
+**Macro Assignment:**
+- In Button Mapping tab, target dropdown includes "Macro: [name]"
+- Macros stored in profile alongside button mappings
+
+### Phase 5: Polish & Distribution 📋 PLANNED
 - [ ] RPM packaging for openSUSE
+- [ ] DEB packaging for Debian/Ubuntu
 - [ ] AppImage for universal Linux
 - [ ] Auto-start configuration
-- [ ] User documentation
+- [ ] User documentation (README updated ✅)
 - [ ] Support additional Razer mice
+- [ ] **Import profiles from Windows Razer Synapse** (research needed)
+
+#### Razer Synapse Profile Import (Research Required)
+
+**Synapse Profile Locations (Windows):**
+- Synapse 2: `%AppData%\Razer\Synapse\Profiles\`
+- Synapse 3: `%LocalAppData%\Razer\Synapse3\Profiles\` or cloud-synced
+
+**Potential Approaches:**
+1. Parse Synapse XML/JSON profile files
+2. Export from Synapse → convert script
+3. Manual profile recreation wizard
+
+**Research TODO:**
+- [ ] Document Synapse profile file format
+- [ ] Identify which settings can be imported (DPI, macros, lighting?)
+- [ ] Create profile conversion utility
+
+---
+
+### Current Progress Summary (Jan 2026)
+
+| Phase | Status | Completion |
+|-------|--------|------------|
+| Phase 1: Foundation | ✅ Complete | 100% |
+| Phase 2: Button Mapping | ✅ Complete | ~90% (auto-detect pending) |
+| Phase 3: Profiles | ✅ Complete | ~85% (systemd pending) |
+| Phase 4: Advanced Features | 🔄 In Progress | ~20% (macros next) |
+| Phase 5: Polish & Distribution | 📋 Planned | 0% (Synapse import planned) |
+
+**Next Priority: Macro System**
+- Add 📝 Macros tab to UI
+- Implement macro data structures
+- Macro recording/playback
+- Assign macros to buttons
 
 ---
 

@@ -1,5 +1,6 @@
 //! Software button remapping (evdev grab + uinput virtual device)
 
+use crate::overlay::OverlayCommand;
 use anyhow::{Context, Result};
 use evdev::{AttributeSet, Device, EventType, InputEvent, InputEventKind, Key, uinput::VirtualDeviceBuilder};
 use std::collections::BTreeMap;
@@ -8,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc::Sender,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +19,14 @@ use tracing::{info, warn};
 pub struct RemapConfig {
     pub source_device: Option<String>,
     pub mappings: BTreeMap<u16, MappingTarget>,
+    /// Enable Windows-style autoscroll (middle click to enter scroll mode)
+    pub autoscroll_enabled: bool,
+}
+
+/// Extended config passed to remapper thread (includes non-Clone items)
+pub struct RemapConfigExt {
+    pub config: RemapConfig,
+    pub overlay_sender: Option<Sender<OverlayCommand>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -130,12 +140,17 @@ pub struct Remapper {
 }
 
 impl Remapper {
-    pub fn start(config: RemapConfig) -> Result<Self> {
+    pub fn start(config: RemapConfig, overlay_sender: Option<Sender<OverlayCommand>>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
 
+        let ext_config = RemapConfigExt {
+            config,
+            overlay_sender,
+        };
+
         let join = thread::spawn(move || {
-            if let Err(e) = run_remapper_loop(stop_thread, config) {
+            if let Err(e) = run_remapper_loop(stop_thread, ext_config) {
                 warn!("remapper stopped: {e:#}");
             }
         });
@@ -163,7 +178,10 @@ impl Drop for Remapper {
     }
 }
 
-fn run_remapper_loop(stop: Arc<AtomicBool>, config: RemapConfig) -> Result<()> {
+fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Result<()> {
+    let config = ext_config.config;
+    let overlay_sender = ext_config.overlay_sender;
+    
     // Find ALL Razer keyboard interfaces - the Naga Trinity sends side button keys
     // through multiple interfaces (event9 AND event11), so we need to grab them all
     let source_paths = select_all_razer_keyboard_devices(&config.source_device);
@@ -250,6 +268,23 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, config: RemapConfig) -> Result<()> {
     
     info!("Virtual device created, processing events from {} source(s)...", devices.len());
     info!("Active mappings: {:?}", config.mappings);
+    info!("Autoscroll enabled: {}", config.autoscroll_enabled);
+
+    // Autoscroll state - Windows style: cursor moves, distance from anchor controls scroll
+    let mut autoscroll_active = false;
+    let mut autoscroll_moved = false;  // Track if mouse moved during autoscroll
+    let mut anchor_x: i32 = 0;  // Anchor point X (where middle-click happened)
+    let mut anchor_y: i32 = 0;  // Anchor point Y
+    let mut cursor_x: i32 = 0;  // Current cursor position X
+    let mut cursor_y: i32 = 0;  // Current cursor position Y
+    let mut scroll_tick_counter: u32 = 0;  // For throttling scroll events
+    const SCROLL_THRESHOLD: i32 = 20;  // Pixels from anchor before scrolling starts
+    const SCROLL_SPEED_DIVISOR: f32 = 50.0;  // Higher = slower scrolling
+    const SCROLL_TICK_INTERVAL: u32 = 5;  // Emit scroll every N movement events
+    const DIRECTION_UPDATE_INTERVAL: u32 = 20;  // Update overlay direction every N events
+    const BTN_MIDDLE: u16 = 274;
+    const REL_WHEEL: u16 = 8;
+    const REL_HWHEEL: u16 = 6;
 
     while !stop.load(Ordering::Relaxed) {
         let mut had_events = false;
@@ -259,6 +294,140 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, config: RemapConfig) -> Result<()> {
                 Ok(events) => {
                     for ev in events {
                         had_events = true;
+                        
+                        // Handle autoscroll if enabled
+                        if config.autoscroll_enabled {
+                            // Check for middle button press/release
+                            if let InputEventKind::Key(key) = ev.kind() {
+                                if key.code() == BTN_MIDDLE {
+                                    if ev.value() == 1 {
+                                        // Middle button pressed - enter autoscroll mode
+                                        info!("AUTOSCROLL: Middle button pressed - entering scroll mode");
+                                        autoscroll_active = true;
+                                        autoscroll_moved = false;
+                                        scroll_tick_counter = 0;
+                                        // Set anchor to current cursor position (we'll track relative movement)
+                                        anchor_x = 0;
+                                        anchor_y = 0;
+                                        cursor_x = 0;
+                                        cursor_y = 0;
+                                        
+                                        // Show overlay indicator
+                                        if let Some(ref sender) = overlay_sender {
+                                            let _ = sender.send(OverlayCommand::Show);
+                                        }
+                                        
+                                        // Don't pass through the middle button press
+                                        continue;
+                                    } else if ev.value() == 0 {
+                                        // Middle button released
+                                        if autoscroll_active {
+                                            info!("AUTOSCROLL: Middle button released - exiting scroll mode (moved={})", autoscroll_moved);
+                                            autoscroll_active = false;
+                                            
+                                            // Hide overlay indicator
+                                            if let Some(ref sender) = overlay_sender {
+                                                let _ = sender.send(OverlayCommand::Hide);
+                                            }
+                                            
+                                            // If we didn't move, emit a normal middle click
+                                            if !autoscroll_moved {
+                                                info!("AUTOSCROLL: No movement - emitting normal middle click");
+                                                let press = InputEvent::new(EventType::KEY, BTN_MIDDLE, 1);
+                                                let release = InputEvent::new(EventType::KEY, BTN_MIDDLE, 0);
+                                                let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                                if let Err(e) = vdev.emit(&[press, sync.clone(), release, sync]) {
+                                                    warn!("Failed to emit middle click: {}", e);
+                                                }
+                                            }
+                                            // Don't pass through the middle button release
+                                            continue;
+                                        }
+                                    }
+                                }
+                                
+                                // Any other button click while in autoscroll mode exits it
+                                if autoscroll_active && ev.value() == 1 {
+                                    info!("AUTOSCROLL: Other button pressed - exiting scroll mode");
+                                    autoscroll_active = false;
+                                    
+                                    // Hide overlay indicator
+                                    if let Some(ref sender) = overlay_sender {
+                                        let _ = sender.send(OverlayCommand::Hide);
+                                    }
+                                    
+                                    // Pass through this button press
+                                }
+                            }
+                            
+                            // Handle mouse movement in autoscroll mode
+                            // Windows-style: cursor moves freely, scroll based on distance from anchor
+                            if autoscroll_active {
+                                if let InputEventKind::RelAxis(axis) = ev.kind() {
+                                    match axis {
+                                        evdev::RelativeAxisType::REL_X => {
+                                            cursor_x += ev.value();
+                                            autoscroll_moved = true;
+                                            // Pass through mouse movement so cursor moves
+                                        }
+                                        evdev::RelativeAxisType::REL_Y => {
+                                            cursor_y += ev.value();
+                                            autoscroll_moved = true;
+                                            // Pass through mouse movement so cursor moves
+                                        }
+                                        _ => {}
+                                    }
+                                    
+                                    scroll_tick_counter += 1;
+                                    
+                                    // Emit scroll events periodically based on distance from anchor
+                                    if scroll_tick_counter >= SCROLL_TICK_INTERVAL {
+                                        scroll_tick_counter = 0;
+                                        
+                                        let dx = cursor_x - anchor_x;
+                                        let dy = cursor_y - anchor_y;
+                                        
+                                        // Only scroll if beyond threshold
+                                        if dx.abs() > SCROLL_THRESHOLD {
+                                            let scroll_amount = ((dx.abs() - SCROLL_THRESHOLD) as f32 / SCROLL_SPEED_DIVISOR) as i32;
+                                            if scroll_amount > 0 {
+                                                let scroll_val = if dx > 0 { scroll_amount } else { -scroll_amount };
+                                                let scroll_ev = InputEvent::new(EventType::RELATIVE, REL_HWHEEL, scroll_val);
+                                                let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                                if let Err(e) = vdev.emit(&[scroll_ev, sync]) {
+                                                    warn!("Failed to emit hwheel: {}", e);
+                                                }
+                                            }
+                                        }
+                                        
+                                        if dy.abs() > SCROLL_THRESHOLD {
+                                            let scroll_amount = ((dy.abs() - SCROLL_THRESHOLD) as f32 / SCROLL_SPEED_DIVISOR) as i32;
+                                            if scroll_amount > 0 {
+                                                // Negative because mouse down = scroll down (content up)
+                                                let scroll_val = if dy > 0 { -scroll_amount } else { scroll_amount };
+                                                let scroll_ev = InputEvent::new(EventType::RELATIVE, REL_WHEEL, scroll_val);
+                                                let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                                if let Err(e) = vdev.emit(&[scroll_ev, sync]) {
+                                                    warn!("Failed to emit wheel: {}", e);
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Update overlay direction (throttled)
+                                        if scroll_tick_counter % DIRECTION_UPDATE_INTERVAL == 0 {
+                                            if let Some(ref sender) = overlay_sender {
+                                                let norm_dx = (dx as f32 / 100.0).clamp(-1.0, 1.0);
+                                                let norm_dy = (dy as f32 / 100.0).clamp(-1.0, 1.0);
+                                                let _ = sender.send(OverlayCommand::UpdateDirection(norm_dx, norm_dy));
+                                            }
+                                        }
+                                    }
+                                    
+                                    // DON'T continue here - let mouse movement pass through
+                                }
+                            }
+                        }
+                        
                         // Debug log events by type
                         match ev.kind() {
                             InputEventKind::Key(key) => {
@@ -514,9 +683,15 @@ fn select_all_razer_keyboard_devices(preferred_device: &Option<String>) -> Vec<P
         }).unwrap_or(0);
         
         // Check for mouse buttons (thumb buttons: BTN_SIDE, BTN_EXTRA, etc.)
-        let has_mouse_btns = keys.as_ref().map(|k| {
+        let has_thumb_btns = keys.as_ref().map(|k| {
             k.contains(Key::BTN_SIDE) || k.contains(Key::BTN_EXTRA) ||
             k.contains(Key::BTN_FORWARD) || k.contains(Key::BTN_BACK)
+        }).unwrap_or(false);
+        
+        // Check for main mouse buttons (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE)
+        // Needed for autoscroll which intercepts BTN_MIDDLE
+        let has_main_mouse_btns = keys.as_ref().map(|k| {
+            k.contains(Key::BTN_LEFT) || k.contains(Key::BTN_MIDDLE)
         }).unwrap_or(false);
         
         // Grab the DPI button virtual device (it has F13/F14 keys)
@@ -524,12 +699,15 @@ fn select_all_razer_keyboard_devices(preferred_device: &Option<String>) -> Vec<P
             info!("  Found DPI button virtual device: {:?}", path);
             razer_devices.push(path);
         }
-        // Grab interfaces that have keyboard keys OR mouse thumb buttons
+        // Grab interfaces that have keyboard keys OR mouse thumb buttons OR main mouse buttons
         else if num_keys > 0 {
             info!("  Found Razer keyboard interface: {:?} [keys={}]", path, num_keys);
             razer_devices.push(path);
-        } else if has_mouse_btns {
+        } else if has_thumb_btns {
             info!("  Found Razer mouse interface: {:?} [has_thumb_btns=true]", path);
+            razer_devices.push(path);
+        } else if has_main_mouse_btns {
+            info!("  Found Razer main mouse interface: {:?} [has_main_btns=true]", path);
             razer_devices.push(path);
         }
     }

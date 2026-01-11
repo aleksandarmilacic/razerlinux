@@ -65,6 +65,7 @@ export component MainWindow inherits Window {
 
     // Remapping state
     in-out property <bool> remap-enabled: false;
+    in-out property <bool> autoscroll-enabled: false;  // Windows-style middle-click autoscroll
     in-out property <int> remap-source-code: 0;
     in-out property <int> remap-target-code: 1;
     in-out property <bool> remap-mod-ctrl: false;
@@ -127,17 +128,36 @@ export component MainWindow inherits Window {
     property <int> dpi-down-code: 184;    // KEY_F14 (for DPI Down button)
     property <int> dpi-up-code: 183;      // KEY_F13 (for DPI Up button)
 
+    // Macro state
+    in-out property <string> macro-list-text: "No macros defined";
+    in-out property <string> macro-actions-text: "No actions";
+    in-out property <string> current-macro-name: "";
+    in-out property <int> selected-macro-id: 0;
+    in-out property <bool> macro-recording: false;
+
     // Callbacks to Rust
     callback apply-dpi(int, int);
     callback refresh-device();
     callback save-profile(string);
     callback load-profile(string);
     callback remap-set-enabled(bool);
+    callback autoscroll-set-enabled(bool);  // Toggle Windows-style autoscroll
     callback remap-learn-source();
     callback remap-add-mapping(int, int, bool, bool, bool, bool);
     callback remap-clear();
     callback remap-update-target-label(int, bool, bool, bool, bool);
     callback remap-remove-mapping(int);
+    
+    // Macro callbacks
+    callback new-macro();
+    callback edit-macro(int);
+    callback delete-macro(int);
+    callback save-macro(string, int);
+    callback start-macro-recording();
+    callback stop-macro-recording();
+    callback add-macro-keypress();
+    callback add-macro-delay();
+    callback test-macro();
     
     // Helper function to get source code for selected button
     function get-selected-source-code() -> int {
@@ -523,8 +543,31 @@ export component MainWindow inherits Window {
                             }
                         }
                         
+                        // Windows-style autoscroll toggle
+                        HorizontalLayout {
+                            spacing: 10px;
+                            alignment: center;
+                            
+                            CheckBox {
+                                text: "Windows Autoscroll";
+                                checked: autoscroll-enabled;
+                                enabled: remap-enabled;  // Only available when remapping is on
+                                toggled => {
+                                    autoscroll-enabled = self.checked;
+                                    autoscroll-set-enabled(self.checked);
+                                }
+                            }
+                            
+                            Text {
+                                text: "ⓘ";
+                                color: #888888;
+                                font-size: 12px;
+                                // Tooltip would go here
+                            }
+                        }
+                        
                         Text {
-                            text: remap-enabled ? "⚡ Active" : "⏸ Disabled";
+                            text: remap-enabled ? (autoscroll-enabled ? "⚡ Active + Autoscroll" : "⚡ Active") : "⏸ Disabled";
                             color: remap-enabled ? #00ff00 : #888888;
                             font-weight: 600;
                             horizontal-alignment: center;
@@ -823,7 +866,190 @@ export component MainWindow inherits Window {
             }
             
             Tab {
-                title: "💾 Profiles";
+                title: "� Macros";
+                
+                HorizontalLayout {
+                    padding: 20px;
+                    spacing: 20px;
+                    
+                    // Left side: Macro list
+                    VerticalLayout {
+                        spacing: 10px;
+                        width: 250px;
+                        
+                        Text {
+                            text: "Saved Macros";
+                            font-size: 16px;
+                            font-weight: 600;
+                            color: #ffffff;
+                        }
+                        
+                        Rectangle {
+                            background: #252540;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: #333355;
+                            min-height: 300px;
+                            
+                            ScrollView {
+                                VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 5px;
+                                    
+                                    // Placeholder for macro list - will be populated dynamically
+                                    Text {
+                                        text: macro-list-text;
+                                        color: macro-list-text == "No macros defined" ? #666666 : #ffffff;
+                                        font-size: 12px;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        HorizontalLayout {
+                            spacing: 10px;
+                            alignment: center;
+                            
+                            Button {
+                                text: "➕ New";
+                                clicked => { new-macro(); }
+                            }
+                            Button {
+                                text: "✏️ Edit";
+                                enabled: selected-macro-id > 0;
+                                clicked => { edit-macro(selected-macro-id); }
+                            }
+                            Button {
+                                text: "🗑️ Delete";
+                                enabled: selected-macro-id > 0;
+                                clicked => { delete-macro(selected-macro-id); }
+                            }
+                        }
+                    }
+                    
+                    // Right side: Macro editor
+                    VerticalLayout {
+                        spacing: 15px;
+                        horizontal-stretch: 1;
+                        
+                        Text {
+                            text: "Macro Editor";
+                            font-size: 16px;
+                            font-weight: 600;
+                            color: #ffffff;
+                        }
+                        
+                        GroupBox {
+                            title: "Macro Details";
+                            
+                            VerticalLayout {
+                                padding: 15px;
+                                spacing: 10px;
+                                
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Text { text: "Name:"; color: #aaaaaa; min-width: 80px; vertical-alignment: center; }
+                                    macro-name-edit := LineEdit {
+                                        placeholder-text: "Enter macro name";
+                                        text: current-macro-name;
+                                        min-width: 200px;
+                                    }
+                                }
+                                
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Text { text: "Repeat:"; color: #aaaaaa; min-width: 80px; vertical-alignment: center; }
+                                    macro-repeat := SpinBox {
+                                        minimum: 0;
+                                        maximum: 100;
+                                        value: 1;
+                                    }
+                                    Text { text: "(0 = while held)"; color: #666666; font-size: 11px; vertical-alignment: center; }
+                                }
+                            }
+                        }
+                        
+                        GroupBox {
+                            title: "Actions";
+                            
+                            VerticalLayout {
+                                padding: 15px;
+                                spacing: 10px;
+                                
+                                Rectangle {
+                                    background: #1a1a2e;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: #333355;
+                                    min-height: 150px;
+                                    
+                                    ScrollView {
+                                        VerticalLayout {
+                                            padding: 10px;
+                                            spacing: 3px;
+                                            
+                                            Text {
+                                                text: macro-actions-text;
+                                                color: macro-actions-text == "No actions" ? #666666 : #00ff00;
+                                                font-size: 11px;
+                                                font-family: "monospace";
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    alignment: center;
+                                    
+                                    Button {
+                                        text: "🔴 Record";
+                                        clicked => { start-macro-recording(); }
+                                    }
+                                    Button {
+                                        text: "⏹️ Stop";
+                                        clicked => { stop-macro-recording(); }
+                                    }
+                                    Button {
+                                        text: "➕ Add Key";
+                                        clicked => { add-macro-keypress(); }
+                                    }
+                                    Button {
+                                        text: "⏱️ Add Delay";
+                                        clicked => { add-macro-delay(); }
+                                    }
+                                }
+                                
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    alignment: center;
+                                    
+                                    Button {
+                                        text: "▶️ Test Macro";
+                                        clicked => { test-macro(); }
+                                    }
+                                    Button {
+                                        text: "💾 Save Macro";
+                                        clicked => { save-macro(macro-name-edit.text, macro-repeat.value); }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        Text {
+                            text: "💡 Tip: Assign macros to buttons in the Button Mapping tab";
+                            font-size: 11px;
+                            color: #666666;
+                            horizontal-alignment: center;
+                        }
+                        
+                        Rectangle { vertical-stretch: 1; }
+                    }
+                }
+            }
+            
+            Tab {
+                title: "�💾 Profiles";
                 
                 VerticalLayout {
                     padding: 20px;

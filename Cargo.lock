@@ -3813,6 +3813,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "udev",
+ "x11rb",
 ]
 
 [[package]]

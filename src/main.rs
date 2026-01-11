@@ -5,6 +5,7 @@
 
 mod device;
 mod hidpoll;
+mod overlay;
 mod profile;
 mod protocol;
 mod remap;
@@ -51,6 +52,12 @@ fn main() -> Result<()> {
     let remap_mappings: Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>> =
         Rc::new(RefCell::new(BTreeMap::new()));
     
+    // Autoscroll enabled state (Windows-style middle-click scroll)
+    let autoscroll_enabled: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    
+    // Autoscroll overlay (Phase 2 - visual indicator)
+    let autoscroll_overlay: Rc<RefCell<Option<overlay::AutoscrollOverlay>>> = Rc::new(RefCell::new(None));
+    
     // DPI button poller - polls hidraw for DPI button presses and injects F13/F14 events
     let dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>> = Rc::new(RefCell::new(None));
 
@@ -58,7 +65,7 @@ fn main() -> Result<()> {
     connect_device(&main_window, &device);
 
     // Setup callbacks
-    setup_callbacks(&main_window, device, remapper, remap_mappings, dpi_poller);
+    setup_callbacks(&main_window, device, remapper, remap_mappings, dpi_poller, autoscroll_enabled, autoscroll_overlay);
 
     // Run the GUI event loop
     info!("Starting GUI...");
@@ -149,6 +156,8 @@ fn setup_callbacks(
     remapper: Rc<RefCell<Option<remap::Remapper>>>,
     remap_mappings: Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
     dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
+    autoscroll_enabled: Rc<RefCell<bool>>,
+    autoscroll_overlay: Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
 ) {
     // Apply DPI callback
     let device_clone = device.clone();
@@ -217,6 +226,7 @@ fn setup_callbacks(
                     alt: t.mods.alt,
                     shift: t.mods.shift,
                     meta: t.mods.meta,
+                    macro_id: None,
                 })
                 .collect();
 
@@ -246,6 +256,8 @@ fn setup_callbacks(
     let remap_mappings_clone = remap_mappings.clone();
     let remapper_clone = remapper.clone();
     let dpi_poller_clone = dpi_poller.clone();
+    let autoscroll_clone = autoscroll_enabled.clone();
+    let overlay_clone = autoscroll_overlay.clone();
     let window_weak = window.as_weak();
     window.on_load_profile(move |profile_name| {
         info!("Loading profile: {}", profile_name);
@@ -295,9 +307,10 @@ fn setup_callbacks(
 
                             // Start/stop remapper to match profile
                             if profile.remap.enabled {
-                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone);
+                                let autoscroll = *autoscroll_clone.borrow();
+                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll);
                             } else {
-                                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone);
+                                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                             }
 
                             win.set_status_message(format!("Profile '{}' loaded!", name).into());
@@ -316,13 +329,40 @@ fn setup_callbacks(
     let remapper_clone = remapper.clone();
     let remap_mappings_clone = remap_mappings.clone();
     let dpi_poller_clone = dpi_poller.clone();
+    let autoscroll_clone = autoscroll_enabled.clone();
+    let overlay_clone = autoscroll_overlay.clone();
     window.on_remap_set_enabled(move |enabled| {
         if let Some(win) = window_weak.upgrade() {
             if enabled {
-                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone);
+                let autoscroll = *autoscroll_clone.borrow();
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll);
             } else {
-                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone);
+                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                 win.set_status_message("Remapping disabled".into());
+            }
+        }
+    });
+
+    // Autoscroll toggle - requires restart of remapper to take effect
+    let window_weak = window.as_weak();
+    let autoscroll_clone = autoscroll_enabled.clone();
+    let remapper_clone = remapper.clone();
+    let device_clone = device.clone();
+    let remap_mappings_clone = remap_mappings.clone();
+    let dpi_poller_clone = dpi_poller.clone();
+    let overlay_clone = autoscroll_overlay.clone();
+    window.on_autoscroll_set_enabled(move |enabled| {
+        info!("Autoscroll set to: {}", enabled);
+        *autoscroll_clone.borrow_mut() = enabled;
+        
+        // If remapper is running, restart it to apply new autoscroll setting
+        if remapper_clone.borrow().is_some() {
+            if let Some(win) = window_weak.upgrade() {
+                info!("Restarting remapper to apply autoscroll setting");
+                stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
+                // Give time for devices to be properly ungrabbed
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, enabled);
             }
         }
     });
@@ -458,6 +498,104 @@ fn setup_callbacks(
             }
         }
     });
+    
+    // =====================
+    // Macro Callbacks (stubs for now)
+    // =====================
+    
+    let window_weak = window.as_weak();
+    window.on_new_macro(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("New macro requested");
+            win.set_current_macro_name("".into());
+            win.set_macro_actions_text("No actions".into());
+            win.set_selected_macro_id(0);
+            win.set_status_message("Creating new macro...".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_edit_macro(move |macro_id| {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Edit macro {} requested", macro_id);
+            win.set_status_message(format!("Editing macro {}", macro_id).into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_delete_macro(move |macro_id| {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Delete macro {} requested", macro_id);
+            win.set_status_message(format!("Deleted macro {}", macro_id).into());
+            win.set_macro_list_text("No macros defined".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_save_macro(move |name, repeat| {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Save macro '{}' with repeat={}", name, repeat);
+            if name.is_empty() {
+                win.set_status_message("Please enter a macro name".into());
+                return;
+            }
+            win.set_status_message(format!("Saved macro '{}'", name).into());
+            // TODO: Actually save to profile
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_start_macro_recording(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Macro recording started");
+            win.set_macro_recording(true);
+            win.set_status_message("Recording macro... press keys to record".into());
+            win.set_macro_actions_text("Recording...".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_stop_macro_recording(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Macro recording stopped");
+            win.set_macro_recording(false);
+            win.set_status_message("Recording stopped".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_add_macro_keypress(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Add keypress to macro");
+            win.set_status_message("Click a key to add to macro...".into());
+            // TODO: Implement key capture
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_add_macro_delay(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Add delay to macro");
+            // Add a default 100ms delay
+            let current = win.get_macro_actions_text().to_string();
+            let new_text = if current == "No actions" || current == "Recording..." {
+                "⏱ 100ms".to_string()
+            } else {
+                format!("{}\n⏱ 100ms", current)
+            };
+            win.set_macro_actions_text(new_text.into());
+            win.set_status_message("Added 100ms delay".into());
+        }
+    });
+    
+    let window_weak = window.as_weak();
+    window.on_test_macro(move || {
+        if let Some(win) = window_weak.upgrade() {
+            info!("Test macro requested");
+            win.set_status_message("Testing macro... (not implemented yet)".into());
+            // TODO: Actually execute the macro via uinput
+        }
+    });
 }
 
 fn start_remapper(
@@ -466,6 +604,8 @@ fn start_remapper(
     remapper: &Rc<RefCell<Option<remap::Remapper>>>,
     mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
     dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
+    autoscroll_overlay: &Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
+    autoscroll_enabled: bool,
 ) {
     if remapper.borrow().is_some() {
         win.set_status_message("Remapping already enabled".into());
@@ -491,6 +631,7 @@ fn start_remapper(
     let config = remap::RemapConfig {
         source_device: None,
         mappings: mappings.borrow().clone(),
+        autoscroll_enabled,
     };
 
     // Start the DPI button poller FIRST so its virtual device exists
@@ -509,7 +650,25 @@ fn start_remapper(
         }
     }
 
-    match remap::Remapper::start(config) {
+    // Create overlay for autoscroll if enabled
+    let overlay_sender = if autoscroll_enabled {
+        match overlay::AutoscrollOverlay::start() {
+            Ok(ol) => {
+                let sender = ol.sender();
+                *autoscroll_overlay.borrow_mut() = Some(ol);
+                info!("Autoscroll overlay created");
+                Some(sender)
+            }
+            Err(e) => {
+                warn!("Failed to create autoscroll overlay: {} - will work without visual indicator", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    match remap::Remapper::start(config, overlay_sender) {
         Ok(r) => {
             *remapper.borrow_mut() = Some(r);
             win.set_status_message("Remapping enabled (virtual device active)".into());
@@ -523,6 +682,10 @@ fn start_remapper(
             if let Some(poller) = dpi_poller.borrow_mut().take() {
                 poller.stop();
             }
+            // Clean up overlay
+            if let Some(ol) = autoscroll_overlay.borrow_mut().take() {
+                ol.shutdown();
+            }
             win.set_remap_enabled(false);
             win.set_status_message(format!("Remap start failed: {e}").into());
         }
@@ -533,6 +696,7 @@ fn stop_remapper(
     device: &Rc<RefCell<Option<device::RazerDevice>>>,
     remapper: &Rc<RefCell<Option<remap::Remapper>>>,
     dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
+    autoscroll_overlay: &Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
 ) {
     if let Some(r) = remapper.borrow_mut().take() {
         r.stop();
@@ -542,6 +706,12 @@ fn stop_remapper(
     if let Some(p) = dpi_poller.borrow_mut().take() {
         p.stop();
         info!("DPI button poller stopped");
+    }
+    
+    // Stop the autoscroll overlay
+    if let Some(ol) = autoscroll_overlay.borrow_mut().take() {
+        ol.shutdown();
+        info!("Autoscroll overlay stopped");
     }
 
     // Disable Driver Mode - restore normal operation
