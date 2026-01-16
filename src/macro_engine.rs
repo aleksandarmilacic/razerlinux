@@ -416,3 +416,180 @@ pub fn key_name(code: u16) -> String {
         _ => format!("KEY_{}", code),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::{Macro, MacroActionType};
+
+    #[test]
+    fn test_macro_manager_creation() {
+        let mgr = MacroManager::new();
+        assert!(!mgr.is_recording());
+        assert_eq!(mgr.get_next_id(), 1);
+    }
+
+    #[test]
+    fn test_start_recording() {
+        let mut mgr = MacroManager::new();
+        let id = mgr.start_recording("Test Macro");
+        
+        assert!(mgr.is_recording());
+        assert_eq!(id, 1);
+        assert_eq!(mgr.get_next_id(), 2);
+    }
+
+    #[test]
+    fn test_record_key_press_release() {
+        let mut mgr = MacroManager::new();
+        mgr.start_recording("Test");
+        
+        // Record a key press and release
+        mgr.record_key_press(30); // KEY_A
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mgr.record_key_release(30);
+        
+        let macro_data = mgr.stop_recording().unwrap();
+        
+        // Should have: KeyPress, possibly Delay, KeyRelease
+        assert!(macro_data.actions.len() >= 2);
+        assert!(matches!(macro_data.actions[0].action_type, MacroActionType::KeyPress));
+        assert_eq!(macro_data.actions[0].key_code, Some(30));
+    }
+
+    #[test]
+    fn test_stop_recording_saves_macro() {
+        let mut mgr = MacroManager::new();
+        mgr.start_recording("Saved Macro");
+        mgr.record_key_press(16); // Q
+        mgr.record_key_release(16);
+        
+        let saved = mgr.stop_recording();
+        assert!(saved.is_some());
+        
+        // Should be retrievable
+        let retrieved = mgr.get_macro(1);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().name, "Saved Macro");
+    }
+
+    #[test]
+    fn test_cancel_recording() {
+        let mut mgr = MacroManager::new();
+        mgr.start_recording("Will Cancel");
+        mgr.record_key_press(30);
+        mgr.cancel_recording();
+        
+        assert!(!mgr.is_recording());
+        assert!(mgr.get_macro(1).is_none()); // Should not be saved
+    }
+
+    #[test]
+    fn test_delete_macro() {
+        let mut mgr = MacroManager::new();
+        mgr.start_recording("To Delete");
+        mgr.stop_recording();
+        
+        assert!(mgr.get_macro(1).is_some());
+        assert!(mgr.delete_macro(1));
+        assert!(mgr.get_macro(1).is_none());
+    }
+
+    #[test]
+    fn test_update_macro() {
+        let mut mgr = MacroManager::new();
+        mgr.start_recording("Original Name");
+        mgr.stop_recording();
+        
+        assert!(mgr.update_macro(1, "New Name", 5));
+        
+        let m = mgr.get_macro(1).unwrap();
+        assert_eq!(m.name, "New Name");
+        assert_eq!(m.repeat_count, 5);
+    }
+
+    #[test]
+    fn test_remove_recording_action() {
+        let mut mgr = MacroManager::new();
+        mgr.start_recording("Test");
+        
+        mgr.record_key_press(30); // A
+        mgr.record_key_press(31); // S
+        mgr.record_key_press(32); // D
+        
+        let list = mgr.get_recording_actions_list();
+        assert_eq!(list.len(), 3);
+        
+        // Remove middle action
+        assert!(mgr.remove_recording_action(1));
+        
+        let list = mgr.get_recording_actions_list();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_macro_action() {
+        let mut mgr = MacroManager::new();
+        mgr.start_recording("Test");
+        mgr.record_key_press(30);
+        mgr.record_key_press(31);
+        mgr.stop_recording();
+        
+        let m = mgr.get_macro(1).unwrap();
+        assert_eq!(m.actions.len(), 2);
+        
+        // Remove first action
+        assert!(mgr.remove_macro_action(1, 0));
+        
+        let m = mgr.get_macro(1).unwrap();
+        assert_eq!(m.actions.len(), 1);
+    }
+
+    #[test]
+    fn test_key_name() {
+        assert_eq!(key_name(30), "A");
+        assert_eq!(key_name(57), "SPACE");
+        assert_eq!(key_name(28), "ENTER");
+        assert_eq!(key_name(59), "F1");
+        assert_eq!(key_name(272), "LMB");
+        assert_eq!(key_name(999), "KEY_999");
+    }
+
+    #[test]
+    fn test_macro_display_text() {
+        let mut m = Macro::new(1, "Test");
+        m.add_key_press(30);
+        m.add_delay(100);
+        m.add_key_release(30);
+        
+        let text = m.to_display_text();
+        assert!(text.contains("↓"));
+        assert!(text.contains("⏱"));
+        assert!(text.contains("↑"));
+    }
+
+    #[test]
+    fn test_load_export_profile() {
+        let mut mgr = MacroManager::new();
+        
+        // Create some macros
+        mgr.start_recording("Macro1");
+        mgr.record_key_press(30);
+        mgr.stop_recording();
+        
+        mgr.start_recording("Macro2");
+        mgr.record_key_press(31);
+        mgr.stop_recording();
+        
+        // Export
+        let exported = mgr.export_for_profile();
+        assert_eq!(exported.len(), 2);
+        
+        // Create new manager and load
+        let mut mgr2 = MacroManager::new();
+        mgr2.load_from_profile(exported);
+        
+        assert!(mgr2.get_macro(1).is_some());
+        assert!(mgr2.get_macro(2).is_some());
+    }
+}

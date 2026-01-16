@@ -12,19 +12,55 @@ A complete end-to-end solution for configuring and mapping Razer mice on Linux s
 
 ### Current Status (Jan 2026)
 
-#### Completed Features
+#### ✅ Completed Features
+
+**Core Functionality:**
 - ✅ Userspace HID working for Naga Trinity (DPI read/write, firmware, device mode switching)
-- ✅ Slint GUI shipped with modern Qt-like styling
+- ✅ Slint GUI with "cosmic" dark theme
 - ✅ TOML profiles stored under `~/.config/razerlinux/profiles/`
 - ✅ Software remapping via evdev/uinput (key + Ctrl/Alt/Shift/Meta combos)
 - ✅ Driver Mode switching (side buttons send KEY_1-KEY_12 automatically)
 - ✅ Background DPI polling with real-time UI updates
+
+**Macro System:**
+- ✅ Full macro recording with key press/release and timing capture
+- ✅ Persistent KeyCaptureListener for reliable keyboard input capture via evdev
+- ✅ Macro storage with names, repeat counts, and action lists
+- ✅ Macro playback testing via uinput virtual device
+- ✅ Editable action list with selectable items and delete functionality
+- ✅ Visual recording indicator in UI
+
+**Settings & Startup:**
+- ✅ **Autostart on system boot** - Creates XDG autostart desktop entry
+- ✅ **Default profile loading** - Automatically loads selected profile on startup
+- ✅ Settings persistence to `~/.config/razerlinux/settings.toml`
+- ✅ Settings tab with startup options
+
+**Autoscroll:**
 - ✅ **Windows-Style Middle-Click Autoscroll** with visual overlay:
   - X11 overlay window with directional arrows
   - XShape extension for click-through (doesn't interfere with input)
   - Distance-based scroll speed (further from anchor = faster)
   - Throttled overlay updates to prevent X11 flooding
   - Free cursor movement during autoscroll
+
+**Testing:**
+- ✅ **Automated test suite** with 33+ tests covering:
+  - Macro engine (recording, playback, actions management)
+  - Profile serialization/deserialization
+  - HID protocol report generation
+  - Settings management
+  - Integration tests for data formats
+  - Hardware tests (ignored by default, run with `--ignored`)
+
+#### 📁 Project Structure
+
+```
+~/.config/razerlinux/
+├── settings.toml          # App settings (autostart, default profile)
+└── profiles/
+    └── *.toml             # Saved profiles
+```
 
 #### Technical Implementation Details
 
@@ -56,12 +92,29 @@ A complete end-to-end solution for configuring and mapping Razer mice on Linux s
 - `SCROLL_TICK_INTERVAL = 5` - Emit scroll every N mouse events
 - `DIRECTION_UPDATE_INTERVAL = 20` - Update overlay every N events
 
-### Next Up
-- Remap UX presets (numbers/F-keys/arrows), target capture, and per-panel defaults (2/7/12 buttons)
-- Auto-detect side panel / button count from evdev name/capabilities and prefill mappings
+#### 🚧 Next Up
+- Assign macros to mouse buttons (UI to bind macro → button)
+- Remap UX presets (numbers/F-keys/arrows) and per-panel defaults
+- Auto-detect side panel / button count from evdev capabilities
 - RGB lighting control
 - Wayland overlay support (currently X11 only)
-- Packaging (RPM/DEB/AppImage) and tray/autostart
+- System tray with minimize-to-tray option
+- Packaging (RPM/DEB/AppImage)
+
+---
+
+## Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run with output
+cargo test -- --nocapture
+
+# Run hardware tests (requires device + sudo)
+sudo cargo test -- --ignored
+```
 
 ---
 

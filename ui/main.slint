@@ -178,6 +178,11 @@ export component MainWindow inherits Window {
     
     // Macro list for button assignment dropdown (format: "id1:name1,id2:name2,...")
     in-out property <string> available-macros: "";
+    
+    // Settings properties
+    in-out property <bool> autostart-enabled: false;
+    in-out property <string> default-profile: "";
+    in-out property <[string]> profile-list: [];  // List of available profiles
 
     // Callbacks to Rust
     callback apply-dpi(int, int);
@@ -206,6 +211,11 @@ export component MainWindow inherits Window {
     callback record-captured-key(int, bool);  // Called from background thread with captured key
     callback remove-macro-action(int);  // Remove action at index from recording
     callback clear-macro-focus();  // Clear focus from input fields when recording
+    
+    // Settings callbacks
+    callback set-autostart(bool);  // Enable/disable autostart
+    callback set-default-profile(string);  // Set default profile to load on startup
+    callback refresh-profile-list();  // Refresh list of available profiles
     
     // Helper function to get source code for selected button
     function get-selected-source-code() -> int {
@@ -297,7 +307,7 @@ export component MainWindow inherits Window {
         // Main content with tabs
         TabWidget {
             Tab {
-                title: "🎮 Button Mapping";
+                title: "Button Mapping";
                 
                 HorizontalLayout {
                     spacing: 20px;
@@ -496,7 +506,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: "DPI captured via hidraw";
                                     font-size: 7px;
-                                    color: #9ca3af;
+                                    color: #b8bcc4;
                                     horizontal-alignment: center;
                                 }
                                 
@@ -866,7 +876,7 @@ export component MainWindow inherits Window {
             }
             
             Tab {
-                title: "⚙️ DPI Settings";
+                title: "DPI Settings";
                 
                 VerticalLayout {
                     padding: 20px;
@@ -968,7 +978,7 @@ export component MainWindow inherits Window {
             }
             
             Tab {
-                title: "🎬 Macros";
+                title: "Macros";
                 
                 HorizontalLayout {
                     padding: 20px;
@@ -1015,13 +1025,13 @@ export component MainWindow inherits Window {
                                     }
                                     Text {
                                         text: "No macros yet";
-                                        color: #9ca3af;
+                                        color: #b8bcc4;
                                         font-size: 14px;
                                         horizontal-alignment: center;
                                     }
                                     Text {
                                         text: "Create your first macro\nto automate key sequences";
-                                        color: #d1d5db;
+                                        color: #e5e7eb;
                                         font-size: 11px;
                                         horizontal-alignment: center;
                                     }
@@ -1216,7 +1226,7 @@ export component MainWindow inherits Window {
                                     VerticalLayout {
                                         horizontal-stretch: 2;
                                         spacing: 4px;
-                                        Text { text: "Macro Name"; color: #9ca3af; font-size: 11px; font-weight: 600; }
+                                        Text { text: "Macro Name"; color: #b8bcc4; font-size: 11px; font-weight: 600; }
                                         macro-name-edit := LineEdit {
                                             placeholder-text: "e.g., Quick Save, Double Click...";
                                             text: current-macro-name;
@@ -1226,7 +1236,7 @@ export component MainWindow inherits Window {
                                     VerticalLayout {
                                         width: 120px;
                                         spacing: 4px;
-                                        Text { text: "Repeat Count"; color: #9ca3af; font-size: 11px; font-weight: 600; }
+                                        Text { text: "Repeat Count"; color: #b8bcc4; font-size: 11px; font-weight: 600; }
                                         HorizontalLayout {
                                             spacing: 6px;
                                             macro-repeat := SpinBox {
@@ -1248,7 +1258,7 @@ export component MainWindow inherits Window {
                                     text: macro-repeat.value == 0 ? "⚡ Macro will repeat while button is held" : 
                                           macro-repeat.value == 1 ? "▶ Macro will play once per press" :
                                           "🔁 Macro will repeat " + macro-repeat.value + " times per press";
-                                    color: #9ca3af;
+                                    color: #b8bcc4;
                                     font-size: 11px;
                                 }
                             }
@@ -1527,7 +1537,7 @@ export component MainWindow inherits Window {
             }
             
             Tab {
-                title: "�💾 Profiles";
+                title: "Profiles";
                 
                 VerticalLayout {
                     padding: 20px;
@@ -1569,8 +1579,138 @@ export component MainWindow inherits Window {
                             Text {
                                 text: "Profiles are saved to ~/.config/razerlinux/profiles/";
                                 font-size: 11px;
-                                color: #9ca3af;
+                                color: #b8bcc4;
                                 horizontal-alignment: center;
+                            }
+                        }
+                    }
+                    
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+            
+            Tab {
+                title: "Settings";
+                
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 20px;
+                    
+                    // Startup Settings
+                    GroupBox {
+                        title: "Startup";
+                        
+                        VerticalLayout {
+                            padding: 15px;
+                            spacing: 15px;
+                            
+                            // Autostart checkbox
+                            HorizontalLayout {
+                                spacing: 12px;
+                                alignment: start;
+                                
+                                CheckBox {
+                                    text: "Start RazerLinux on system startup";
+                                    checked: autostart-enabled;
+                                    toggled => { 
+                                        autostart-enabled = self.checked;
+                                        set-autostart(self.checked); 
+                                    }
+                                }
+                            }
+                            
+                            // Default profile
+                            HorizontalLayout {
+                                spacing: 12px;
+                                alignment: start;
+                                
+                                Text {
+                                    text: "Default profile to load:";
+                                    color: #e5e7eb;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                }
+                                
+                                default-profile-input := LineEdit {
+                                    text: default-profile;
+                                    placeholder-text: "Enter profile name";
+                                    min-width: 180px;
+                                    edited => {
+                                        default-profile = self.text;
+                                        set-default-profile(self.text);
+                                    }
+                                }
+                            }
+                            
+                            // Available profiles hint
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                
+                                Text {
+                                    text: "💡";
+                                    font-size: 12px;
+                                }
+                                Text {
+                                    text: "Leave empty to start without loading a profile";
+                                    color: #b8bcc4;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Application Settings
+                    GroupBox {
+                        title: "Application";
+                        
+                        VerticalLayout {
+                            padding: 15px;
+                            spacing: 12px;
+                            
+                            CheckBox {
+                                text: "Minimize to system tray on close";
+                                checked: false;
+                                enabled: false;  // TODO: Not yet implemented
+                            }
+                            
+                            CheckBox {
+                                text: "Show notifications for DPI changes";
+                                checked: false;
+                                enabled: false;  // TODO: Not yet implemented
+                            }
+                        }
+                    }
+                    
+                    // About section
+                    GroupBox {
+                        title: "About";
+                        
+                        VerticalLayout {
+                            padding: 15px;
+                            spacing: 8px;
+                            
+                            Text {
+                                text: "RazerLinux";
+                                font-size: 16px;
+                                font-weight: 700;
+                                color: #22c55e;
+                            }
+                            Text {
+                                text: "Version 0.1.0";
+                                font-size: 12px;
+                                color: #e5e7eb;
+                            }
+                            Text {
+                                text: "Open source Razer mouse configuration tool for Linux";
+                                font-size: 11px;
+                                color: #b8bcc4;
+                            }
+                            Text {
+                                text: "Licensed under GPL-3.0-only";
+                                font-size: 11px;
+                                color: #b8bcc4;
                             }
                         }
                     }
@@ -1584,7 +1724,7 @@ export component MainWindow inherits Window {
         Text {
             text: "RazerLinux v0.1.0 • GPL-3.0-only";
             font-size: 10px;
-            color: #9ca3af;
+            color: #b8bcc4;
             horizontal-alignment: center;
         }
     }

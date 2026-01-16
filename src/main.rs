@@ -10,9 +10,12 @@ mod overlay;
 mod profile;
 mod protocol;
 mod remap;
+mod settings;
+mod tray;
 
 use anyhow::Result;
 use profile::{Profile, ProfileManager};
+use settings::AppSettings;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -26,6 +29,11 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     info!("RazerLinux starting...");
+    
+    // Ensure the Default profile exists
+    if let Err(e) = settings::ensure_default_profile_exists() {
+        warn!("Failed to ensure default profile: {}", e);
+    }
 
     // Log all detected Razer input interfaces for debugging
     let interfaces = remap::list_razer_input_interfaces();
@@ -69,7 +77,50 @@ fn main() -> Result<()> {
     connect_device(&main_window, &device);
 
     // Setup callbacks
-    setup_callbacks(&main_window, device, remapper, remap_mappings, dpi_poller, autoscroll_enabled, autoscroll_overlay, macro_manager);
+    setup_callbacks(&main_window, device.clone(), remapper, remap_mappings.clone(), dpi_poller, autoscroll_enabled, autoscroll_overlay, macro_manager.clone());
+    
+    // Load default profile on startup if configured
+    if let Ok(settings) = AppSettings::load() {
+        if !settings.default_profile.is_empty() {
+            info!("Loading default profile on startup: {}", settings.default_profile);
+            load_profile_on_startup(&main_window, &device, &remap_mappings, &macro_manager, &settings.default_profile);
+        }
+    }
+
+    // Create system tray icon
+    let _tray = match tray::TrayIcon::new() {
+        Ok(tray) => {
+            info!("System tray icon created");
+            Some(tray)
+        }
+        Err(e) => {
+            warn!("Failed to create system tray icon: {}", e);
+            None
+        }
+    };
+
+    // Setup tray event handler if tray was created
+    if _tray.is_some() {
+        let window_weak = main_window.as_weak();
+        slint::Timer::default().start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(100),
+            move || {
+                while let Some(cmd) = tray::try_recv_command() {
+                    match cmd {
+                        tray::TrayCommand::ShowWindow => {
+                            if let Some(window) = window_weak.upgrade() {
+                                window.show().ok();
+                            }
+                        }
+                        tray::TrayCommand::Quit => {
+                            slint::quit_event_loop().ok();
+                        }
+                    }
+                }
+            },
+        );
+    }
 
     // Run the GUI event loop
     info!("Starting GUI...");
@@ -847,6 +898,97 @@ fn setup_callbacks(
             }
         }
     });
+    
+    // ===== SETTINGS HANDLERS =====
+    
+    // Load and display current settings
+    let window_weak = window.as_weak();
+    if let Some(win) = window_weak.upgrade() {
+        match AppSettings::load() {
+            Ok(settings) => {
+                win.set_autostart_enabled(settings.autostart || settings::is_autostart_enabled());
+                win.set_default_profile(settings.default_profile.clone().into());
+                
+                // Load default profile on startup if specified
+                if !settings.default_profile.is_empty() {
+                    info!("Loading default profile: {}", settings.default_profile);
+                    // We'll trigger load after all callbacks are set up
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load settings: {}", e);
+            }
+        }
+    }
+    
+    // Set autostart callback
+    let window_weak = window.as_weak();
+    window.on_set_autostart(move |enabled| {
+        info!("Setting autostart: {}", enabled);
+        if let Some(win) = window_weak.upgrade() {
+            match AppSettings::load() {
+                Ok(mut settings) => {
+                    if let Err(e) = settings.set_autostart(enabled) {
+                        error!("Failed to set autostart: {}", e);
+                        win.set_status_message(format!("Failed to set autostart: {}", e).into());
+                    } else {
+                        win.set_status_message(if enabled {
+                            "Autostart enabled".into()
+                        } else {
+                            "Autostart disabled".into()
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    win.set_status_message(format!("Settings error: {}", e).into());
+                }
+            }
+        }
+    });
+    
+    // Set default profile callback
+    let window_weak = window.as_weak();
+    window.on_set_default_profile(move |profile_name| {
+        let name = profile_name.to_string();
+        info!("Setting default profile: '{}'", name);
+        if let Some(win) = window_weak.upgrade() {
+            match AppSettings::load() {
+                Ok(mut settings) => {
+                    if let Err(e) = settings.set_default_profile(&name) {
+                        error!("Failed to set default profile: {}", e);
+                        win.set_status_message(format!("Failed to save setting: {}", e).into());
+                    } else {
+                        if name.is_empty() {
+                            win.set_status_message("Default profile cleared".into());
+                        } else {
+                            win.set_status_message(format!("Default profile set to '{}'", name).into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    win.set_status_message(format!("Settings error: {}", e).into());
+                }
+            }
+        }
+    });
+    
+    // Refresh profile list callback
+    let window_weak = window.as_weak();
+    window.on_refresh_profile_list(move || {
+        if let Some(win) = window_weak.upgrade() {
+            match settings::get_profile_list() {
+                Ok(profiles) => {
+                    let list: Vec<slint::SharedString> = profiles.into_iter().map(|s| s.into()).collect();
+                    win.set_profile_list(slint::ModelRc::new(slint::VecModel::from(list)));
+                }
+                Err(e) => {
+                    warn!("Failed to get profile list: {}", e);
+                }
+            }
+        }
+    });
 }
 
 fn start_remapper(
@@ -1194,6 +1336,74 @@ fn connect_device_inner(window: &MainWindow, device: &Rc<RefCell<Option<device::
         }
         Err(e) => {
             window.set_status_message(format!("Scan error: {}", e).into());
+        }
+    }
+}
+
+/// Load a profile on startup (simplified version without starting remapper)
+fn load_profile_on_startup(
+    window: &MainWindow,
+    device: &Rc<RefCell<Option<device::RazerDevice>>>,
+    remap_mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+    macro_manager: &Rc<RefCell<macro_engine::MacroManager>>,
+    profile_name: &str,
+) {
+    match ProfileManager::new() {
+        Ok(manager) => {
+            match manager.load_profile(profile_name) {
+                Ok(profile) => {
+                    // Update UI with profile settings
+                    window.set_current_dpi_x(profile.dpi.x as i32);
+                    window.set_current_dpi_y(profile.dpi.y as i32);
+
+                    // Apply DPI to device if connected
+                    if let Some(ref mut dev) = *device.borrow_mut() {
+                        if let Err(e) = dev.set_dpi(profile.dpi.x, profile.dpi.y) {
+                            error!("Failed to apply profile DPI on startup: {}", e);
+                        }
+                    }
+
+                    // Load remap mappings into state
+                    {
+                        let mut map = remap_mappings.borrow_mut();
+                        map.clear();
+                        for m in &profile.remap.mappings {
+                            map.insert(
+                                m.source,
+                                remap::MappingTarget {
+                                    base: m.target,
+                                    mods: remap::Modifiers {
+                                        ctrl: m.ctrl,
+                                        alt: m.alt,
+                                        shift: m.shift,
+                                        meta: m.meta,
+                                    },
+                                },
+                            );
+                        }
+                    }
+                    window.set_remap_enabled(profile.remap.enabled);
+                    update_remap_summary(window, &remap_mappings.borrow());
+                    
+                    // Load macros from profile
+                    {
+                        let mut mgr = macro_manager.borrow_mut();
+                        mgr.load_from_profile(profile.macros.clone());
+                        window.set_macro_list_text(mgr.get_macros_list_text().into());
+                        window.set_available_macros(mgr.get_available_macros_string().into());
+                    }
+
+                    window.set_status_message(format!("Profile '{}' loaded!", profile_name).into());
+                    info!("Loaded default profile '{}' on startup", profile_name);
+                }
+                Err(e) => {
+                    warn!("Failed to load default profile '{}': {}", profile_name, e);
+                    window.set_status_message(format!("Profile '{}' not found", profile_name).into());
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to create profile manager: {}", e);
         }
     }
 }
