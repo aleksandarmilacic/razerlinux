@@ -132,9 +132,18 @@ TRAY_PID=$!
 # Give the tray helper time to start and create the socket
 sleep 0.3
 
-# Check if udev rules allow non-root access
-if [ -r /dev/hidraw0 ] 2>/dev/null; then
-    # Can access hidraw without root, run directly
+# Find Razer hidraw device and check if we can access it
+RAZER_HIDRAW=""
+for hidraw in /sys/class/hidraw/hidraw*/device/uevent; do
+    if grep -q "1532" "$hidraw" 2>/dev/null; then
+        RAZER_HIDRAW="/dev/$(basename $(dirname $(dirname $hidraw)))"
+        break
+    fi
+done
+
+# Check if udev rules allow non-root access to Razer device
+if [ -n "$RAZER_HIDRAW" ] && [ -r "$RAZER_HIDRAW" ] && [ -w "$RAZER_HIDRAW" ]; then
+    # Can access Razer hidraw without root, run directly
     /opt/razerlinux/razerlinux "$@"
 else
     # Need elevated privileges - pass XDG_RUNTIME_DIR for socket path

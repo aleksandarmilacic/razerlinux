@@ -167,11 +167,69 @@ pub fn is_autostart_enabled() -> bool {
 
 // ============ Systemd User Service Control ============
 
+/// Get the real user (not root when running via pkexec/sudo)
+fn get_real_user() -> Option<String> {
+    // Check SUDO_USER first (set by sudo/pkexec)
+    std::env::var("SUDO_USER").ok()
+        .or_else(|| std::env::var("PKEXEC_UID").ok().and_then(|uid| {
+            // Convert UID to username
+            std::process::Command::new("id")
+                .args(["-nu", &uid])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+        }))
+        .or_else(|| std::env::var("USER").ok())
+}
+
+/// Run systemctl --user as the real user (works even when running as root via pkexec)
+fn run_systemctl_user(args: &[&str]) -> std::io::Result<std::process::Output> {
+    let real_user = get_real_user();
+    
+    // If we're running as root but have a real user, use sudo -u
+    if std::env::var("SUDO_USER").is_ok() || std::env::var("PKEXEC_UID").is_ok() {
+        if let Some(ref user) = real_user {
+            // Get the user's UID for XDG_RUNTIME_DIR
+            let uid = std::process::Command::new("id")
+                .args(["-u", user])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "1000".to_string());
+            
+            let runtime_dir_env = format!("XDG_RUNTIME_DIR=/run/user/{}", uid);
+            
+            // Build command: sudo -u USER -- env XDG_RUNTIME_DIR=... systemctl --user <args>
+            let mut full_args: Vec<String> = vec![
+                "-u".to_string(),
+                user.clone(),
+                "--".to_string(),
+                "env".to_string(),
+                runtime_dir_env,
+                "systemctl".to_string(),
+                "--user".to_string(),
+            ];
+            full_args.extend(args.iter().map(|s| s.to_string()));
+            
+            return std::process::Command::new("sudo")
+                .args(&full_args)
+                .output();
+        }
+    }
+    
+    // Running as normal user, use systemctl directly
+    let mut cmd_args = vec!["--user"];
+    cmd_args.extend(args.iter().copied());
+    std::process::Command::new("systemctl")
+        .args(&cmd_args)
+        .output()
+}
+
 /// Check if systemd user service is enabled
 pub fn is_systemd_enabled() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "razerlinux.service"])
-        .output()
+    run_systemctl_user(&["is-enabled", "razerlinux.service"])
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
@@ -189,14 +247,10 @@ pub fn enable_systemd_service() -> Result<()> {
     }
     
     // Reload daemon to pick up any changes
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .output();
+    let _ = run_systemctl_user(&["daemon-reload"]);
     
     // Enable the service
-    let output = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "razerlinux.service"])
-        .output()
+    let output = run_systemctl_user(&["enable", "razerlinux.service"])
         .context("Failed to run systemctl")?;
     
     if output.status.success() {
@@ -210,9 +264,7 @@ pub fn enable_systemd_service() -> Result<()> {
 
 /// Disable the systemd user service
 pub fn disable_systemd_service() -> Result<()> {
-    let output = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "razerlinux.service"])
-        .output()
+    let output = run_systemctl_user(&["disable", "razerlinux.service"])
         .context("Failed to run systemctl")?;
     
     if output.status.success() {
