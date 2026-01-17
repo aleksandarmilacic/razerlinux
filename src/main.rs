@@ -109,8 +109,8 @@ fn main() -> Result<()> {
     let autoscroll_for_startup = autoscroll_enabled.clone();
     let overlay_for_startup = autoscroll_overlay.clone();
 
-    // Setup callbacks
-    setup_callbacks(&main_window, device.clone(), remapper, remap_mappings.clone(), dpi_poller, autoscroll_enabled, autoscroll_overlay, macro_manager.clone());
+    // Setup callbacks - MUST store the poll timer to keep it alive
+    let _poll_timer = setup_callbacks(&main_window, device.clone(), remapper, remap_mappings.clone(), dpi_poller, autoscroll_enabled, autoscroll_overlay, macro_manager.clone());
     
     // Load default profile on startup if configured
     if let Ok(settings) = AppSettings::load() {
@@ -360,7 +360,7 @@ fn setup_callbacks(
     autoscroll_enabled: Rc<RefCell<bool>>,
     autoscroll_overlay: Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
     macro_manager: Rc<RefCell<macro_engine::MacroManager>>,
-) {
+) -> slint::Timer {
     // Apply DPI callback
     let device_clone = device.clone();
     let window_weak = window.as_weak();
@@ -958,8 +958,6 @@ fn setup_callbacks(
             }
         }
     });
-    // Keep timer alive
-    std::mem::forget(poll_timer);
     
     let window_weak = window.as_weak();
     let macro_mgr = macro_manager.clone();
@@ -1224,6 +1222,9 @@ fn setup_callbacks(
             }
         }
     });
+    
+    // Return the poll_timer so it stays alive for the application lifetime
+    poll_timer
 }
 
 fn start_remapper(
