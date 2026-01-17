@@ -99,6 +99,13 @@ impl AppSettings {
         info!("Default profile set to: '{}'", profile);
         self.save()
     }
+    
+    /// Set minimize to tray on close
+    pub fn set_minimize_to_tray(&mut self, enabled: bool) -> Result<()> {
+        self.minimize_to_tray = enabled;
+        info!("Minimize to tray on close: {}", enabled);
+        self.save()
+    }
 }
 
 /// Get the autostart desktop file path

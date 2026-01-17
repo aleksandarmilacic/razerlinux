@@ -92,6 +92,18 @@ pub fn run_tray_helper() -> anyhow::Result<()> {
             "razerlinux".to_string()
         }
         
+        /// Left-click on tray icon - show the window
+        fn activate(&mut self, _x: i32, _y: i32) {
+            println!("TRAY: Left-click detected (activate)");
+            let _ = self.cmd_tx.send(IpcCommand::ShowWindow);
+        }
+        
+        /// Middle-click on tray icon - also show the window
+        fn secondary_activate(&mut self, _x: i32, _y: i32) {
+            println!("TRAY: Middle-click detected (secondary_activate)");
+            let _ = self.cmd_tx.send(IpcCommand::ShowWindow);
+        }
+        
         fn menu(&self) -> Vec<MenuItem<Self>> {
             vec![
                 MenuItem::Standard(StandardItem {
@@ -122,23 +134,38 @@ pub fn run_tray_helper() -> anyhow::Result<()> {
     // Thread to accept connections and read commands
     let running_accept = running.clone();
     thread::spawn(move || {
+        let mut current_reader: Option<BufReader<UnixStream>> = None;
+        
         while running_accept.load(Ordering::Relaxed) {
             // Accept new connections
             if let Ok((stream, _)) = listener.accept() {
                 println!("Main app connected");
                 stream.set_nonblocking(true).ok();
+                // Create a buffered reader for reading, store the write stream separately
+                let read_stream = stream.try_clone().unwrap();
+                current_reader = Some(BufReader::new(read_stream));
                 *main_stream_clone.lock().unwrap() = Some(stream);
             }
             
-            // Read from main app
-            if let Some(ref mut stream) = *main_stream_clone.lock().unwrap() {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
+            // Read from main app using persistent reader
+            if let Some(ref mut reader) = current_reader {
                 let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if let Some(cmd) = IpcCommand::from_str(&line) {
-                        if cmd == IpcCommand::Quit {
-                            running_accept.store(false, Ordering::Relaxed);
+                match reader.read_line(&mut line) {
+                    Ok(n) if n > 0 => {
+                        if let Some(cmd) = IpcCommand::from_str(&line) {
+                            println!("Received command from main app: {:?}", cmd);
+                            if cmd == IpcCommand::Quit {
+                                running_accept.store(false, Ordering::Relaxed);
+                            }
                         }
+                    }
+                    Ok(_) => {} // No data
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // No data available
+                    Err(_) => {
+                        // Connection closed or error - clear the reader
+                        println!("Main app disconnected");
+                        current_reader = None;
+                        *main_stream_clone.lock().unwrap() = None;
                     }
                 }
             }
@@ -151,9 +178,20 @@ pub fn run_tray_helper() -> anyhow::Result<()> {
     while running_clone.load(Ordering::Relaxed) {
         // Check for tray menu commands
         if let Ok(cmd) = cmd_rx.try_recv() {
+            println!("Tray command received from menu: {:?}", cmd);
             if let Some(ref mut stream) = *main_stream.lock().unwrap() {
                 let msg = format!("{}\n", cmd.to_string());
-                let _ = stream.write_all(msg.as_bytes());
+                println!("Sending to main app: {:?}", msg.trim());
+                match stream.write_all(msg.as_bytes()) {
+                    Ok(_) => println!("Write successful"),
+                    Err(e) => println!("Failed to send to main app: {}", e),
+                }
+                match stream.flush() {
+                    Ok(_) => println!("Flush successful"),
+                    Err(e) => println!("Flush failed: {}", e),
+                }
+            } else {
+                println!("No main app connected, cannot send command");
             }
             
             if cmd == IpcCommand::Quit {
@@ -174,17 +212,31 @@ pub fn run_tray_helper() -> anyhow::Result<()> {
 /// Client to connect to tray helper from main app
 pub struct TrayClient {
     stream: Option<UnixStream>,
+    reader: Option<BufReader<UnixStream>>,
+    pending_commands: Vec<IpcCommand>,
 }
 
 impl TrayClient {
     /// Try to connect to the tray helper
     pub fn connect() -> Self {
         let socket_path = socket_path();
-        let stream = UnixStream::connect(&socket_path).ok();
-        if stream.is_some() {
-            println!("Connected to tray helper");
+        match UnixStream::connect(&socket_path) {
+            Ok(stream) => {
+                println!("Connected to tray helper");
+                stream.set_nonblocking(true).ok();
+                let reader = BufReader::new(stream.try_clone().unwrap());
+                Self { 
+                    stream: Some(stream), 
+                    reader: Some(reader),
+                    pending_commands: Vec::new(),
+                }
+            }
+            Err(_) => Self { 
+                stream: None, 
+                reader: None,
+                pending_commands: Vec::new(),
+            }
         }
-        Self { stream }
     }
     
     /// Check if connected to tray helper
@@ -194,12 +246,23 @@ impl TrayClient {
     
     /// Check for commands from tray
     pub fn try_recv(&mut self) -> Option<IpcCommand> {
-        if let Some(ref mut stream) = self.stream {
-            stream.set_nonblocking(true).ok();
-            let mut reader = BufReader::new(stream.try_clone().ok()?);
+        // Return pending commands first
+        if !self.pending_commands.is_empty() {
+            return Some(self.pending_commands.remove(0));
+        }
+        
+        if let Some(ref mut reader) = self.reader {
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) > 0 {
-                return IpcCommand::from_str(&line);
+            match reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {
+                    println!("TrayClient received: {:?}", line.trim());
+                    return IpcCommand::from_str(&line);
+                }
+                Ok(_) => {} // No data available
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // No data
+                Err(e) => {
+                    println!("TrayClient read error: {:?}", e);
+                } // Other error
             }
         }
         None
@@ -209,6 +272,7 @@ impl TrayClient {
     pub fn quit(&mut self) {
         if let Some(ref mut stream) = self.stream {
             let _ = stream.write_all(b"QUIT\n");
+            let _ = stream.flush();
         }
     }
 }

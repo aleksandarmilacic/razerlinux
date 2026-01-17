@@ -183,6 +183,7 @@ export component MainWindow inherits Window {
     in-out property <bool> autostart-enabled: false;
     in-out property <string> default-profile: "";
     in-out property <[string]> profile-list: [];  // List of available profiles
+    in-out property <bool> minimize-to-tray: true;  // Minimize to tray on close
 
     // Callbacks to Rust
     callback apply-dpi(int, int);
@@ -215,6 +216,7 @@ export component MainWindow inherits Window {
     // Settings callbacks
     callback set-autostart(bool);  // Enable/disable autostart
     callback set-default-profile(string);  // Set default profile to load on startup
+    callback set-minimize-to-tray(bool);  // Enable/disable minimize to tray on close
     callback refresh-profile-list();  // Refresh list of available profiles
     
     // Helper function to get source code for selected button
@@ -1592,130 +1594,236 @@ export component MainWindow inherits Window {
             Tab {
                 title: "Settings";
                 
-                VerticalLayout {
-                    padding: 20px;
-                    spacing: 20px;
-                    
-                    // Startup Settings
-                    GroupBox {
-                        title: "Startup";
+                ScrollView {
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 12px;
                         
-                        VerticalLayout {
-                            padding: 15px;
-                            spacing: 15px;
+                        // Startup Settings
+                        Rectangle {
+                            background: #252540;
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: #3a3a5e;
                             
-                            // Autostart checkbox
-                            HorizontalLayout {
-                                spacing: 12px;
-                                alignment: start;
-                                
-                                CheckBox {
-                                    text: "Start RazerLinux on system startup";
-                                    checked: autostart-enabled;
-                                    toggled => { 
-                                        autostart-enabled = self.checked;
-                                        set-autostart(self.checked); 
-                                    }
-                                }
-                            }
-                            
-                            // Default profile
-                            HorizontalLayout {
-                                spacing: 12px;
-                                alignment: start;
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 10px;
                                 
                                 Text {
-                                    text: "Default profile to load:";
-                                    color: #e5e7eb;
-                                    font-size: 13px;
-                                    vertical-alignment: center;
+                                    text: "🚀 Startup";
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    color: #ffffff;
                                 }
                                 
-                                default-profile-input := LineEdit {
-                                    text: default-profile;
-                                    placeholder-text: "Enter profile name";
-                                    min-width: 180px;
-                                    edited => {
-                                        default-profile = self.text;
-                                        set-default-profile(self.text);
+                                // Autostart checkbox
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    
+                                    CheckBox {
+                                        checked: autostart-enabled;
+                                        toggled => { 
+                                            autostart-enabled = self.checked;
+                                            set-autostart(self.checked); 
+                                        }
+                                    }
+                                    Text {
+                                        text: "Start RazerLinux on system startup";
+                                        color: #e0e0e0;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                
+                                // Default profile
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    
+                                    Text {
+                                        text: "Default profile:";
+                                        color: #e0e0e0;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    
+                                    default-profile-input := LineEdit {
+                                        text: default-profile;
+                                        placeholder-text: "Profile name";
+                                        min-width: 150px;
+                                        edited => {
+                                            default-profile = self.text;
+                                            set-default-profile(self.text);
+                                        }
+                                    }
+                                    
+                                    Text {
+                                        text: "(empty = none)";
+                                        color: #888899;
+                                        font-size: 10px;
+                                        vertical-alignment: center;
                                     }
                                 }
                             }
+                        }
+                        
+                        // Application Settings
+                        Rectangle {
+                            background: #252540;
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: #3a3a5e;
                             
-                            // Available profiles hint
-                            HorizontalLayout {
+                            VerticalLayout {
+                                padding: 12px;
                                 spacing: 8px;
-                                alignment: start;
                                 
                                 Text {
-                                    text: "💡";
-                                    font-size: 12px;
+                                    text: "⚙️ Application";
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    color: #ffffff;
                                 }
+                                
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    CheckBox {
+                                        checked: minimize-to-tray;
+                                        toggled => {
+                                            minimize-to-tray = self.checked;
+                                            set-minimize-to-tray(self.checked);
+                                        }
+                                    }
+                                    Text {
+                                        text: "Minimize to system tray on close";
+                                        color: #e0e0e0;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    CheckBox {
+                                        checked: false;
+                                        enabled: false;
+                                    }
+                                    Text {
+                                        text: "Show notifications for DPI changes";
+                                        color: #666677;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: "(coming soon)";
+                                        color: #555566;
+                                        font-size: 10px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // About section
+                        Rectangle {
+                            background: #252540;
+                            border-radius: 10px;
+                            border-width: 1px;
+                            border-color: #3a3a5e;
+                            
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 8px;
+                                
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    alignment: start;
+                                    
+                                    Text {
+                                        text: "🐍";
+                                        font-size: 22px;
+                                    }
+                                    
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        
+                                        Text {
+                                            text: "RazerLinux";
+                                            font-size: 16px;
+                                            font-weight: 700;
+                                            color: #22c55e;
+                                        }
+                                        Text {
+                                            text: "Version 0.1.0";
+                                            font-size: 11px;
+                                            color: #888899;
+                                        }
+                                    }
+                                }
+                                
                                 Text {
-                                    text: "Leave empty to start without loading a profile";
-                                    color: #b8bcc4;
+                                    text: "Open source Razer mouse configuration tool for Linux. Supports the Razer Naga Trinity with button remapping, DPI settings, RGB control, macros, and profile management.";
                                     font-size: 11px;
-                                    vertical-alignment: center;
+                                    color: #b8bcc4;
+                                    wrap: word-wrap;
+                                }
+                                
+                                Rectangle {
+                                    height: 1px;
+                                    background: #3a3a5e;
+                                }
+                                
+                                HorizontalLayout {
+                                    spacing: 16px;
+                                    
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        Text {
+                                            text: "👨‍💻";
+                                            font-size: 10px;
+                                        }
+                                        Text {
+                                            text: "Aleksandar Milacic";
+                                            font-size: 10px;
+                                            color: #b8bcc4;
+                                        }
+                                    }
+                                    
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        Text {
+                                            text: "📦";
+                                            font-size: 10px;
+                                        }
+                                        Text {
+                                            text: "github.com/amilacic/razerlinux";
+                                            font-size: 10px;
+                                            color: #60a5fa;
+                                        }
+                                    }
+                                    
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        Text {
+                                            text: "📜";
+                                            font-size: 10px;
+                                        }
+                                        Text {
+                                            text: "GPL-3.0";
+                                            font-size: 10px;
+                                            color: #b8bcc4;
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                    
-                    // Application Settings
-                    GroupBox {
-                        title: "Application";
                         
-                        VerticalLayout {
-                            padding: 15px;
-                            spacing: 12px;
-                            
-                            CheckBox {
-                                text: "Minimize to system tray on close";
-                                checked: false;
-                                enabled: false;  // TODO: Not yet implemented
-                            }
-                            
-                            CheckBox {
-                                text: "Show notifications for DPI changes";
-                                checked: false;
-                                enabled: false;  // TODO: Not yet implemented
-                            }
-                        }
+                        Rectangle { height: 8px; }
                     }
-                    
-                    // About section
-                    GroupBox {
-                        title: "About";
-                        
-                        VerticalLayout {
-                            padding: 15px;
-                            spacing: 8px;
-                            
-                            Text {
-                                text: "RazerLinux";
-                                font-size: 16px;
-                                font-weight: 700;
-                                color: #22c55e;
-                            }
-                            Text {
-                                text: "Version 0.1.0";
-                                font-size: 12px;
-                                color: #e5e7eb;
-                            }
-                            Text {
-                                text: "Open source Razer mouse configuration tool for Linux";
-                                font-size: 11px;
-                                color: #b8bcc4;
-                            }
-                            Text {
-                                text: "Licensed under GPL-3.0-only";
-                                font-size: 11px;
-                                color: #b8bcc4;
-                            }
-                        }
-                    }
-                    
-                    Rectangle { vertical-stretch: 1; }
                 }
             }
         }
@@ -1724,7 +1832,7 @@ export component MainWindow inherits Window {
         Text {
             text: "RazerLinux v0.1.0 • GPL-3.0-only";
             font-size: 10px;
-            color: #b8bcc4;
+            color: #888899;
             horizontal-alignment: center;
         }
     }

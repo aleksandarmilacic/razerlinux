@@ -100,6 +100,12 @@ fn main() -> Result<()> {
     // Try to find and connect to device on startup
     connect_device(&main_window, &device);
 
+    // Clone refs for use after setup_callbacks (which takes ownership)
+    let remapper_for_startup = remapper.clone();
+    let dpi_poller_for_startup = dpi_poller.clone();
+    let autoscroll_for_startup = autoscroll_enabled.clone();
+    let overlay_for_startup = autoscroll_overlay.clone();
+
     // Setup callbacks
     setup_callbacks(&main_window, device.clone(), remapper, remap_mappings.clone(), dpi_poller, autoscroll_enabled, autoscroll_overlay, macro_manager.clone());
     
@@ -107,37 +113,54 @@ fn main() -> Result<()> {
     if let Ok(settings) = AppSettings::load() {
         if !settings.default_profile.is_empty() {
             info!("Loading default profile on startup: {}", settings.default_profile);
-            load_profile_on_startup(&main_window, &device, &remap_mappings, &macro_manager, &settings.default_profile);
+            load_profile_on_startup(
+                &main_window, 
+                &device, 
+                &remap_mappings, 
+                &macro_manager,
+                &remapper_for_startup,
+                &dpi_poller_for_startup,
+                &autoscroll_for_startup,
+                &overlay_for_startup,
+                &settings.default_profile
+            );
         }
     }
 
     // Connect to the user-space tray helper process (which runs as the user and can show the tray icon)
     // The tray helper is started by the launcher script before running pkexec
-    let tray_client = tray_helper::TrayClient::connect();
+    let tray_client = Rc::new(RefCell::new(tray_helper::TrayClient::connect()));
     
     // Check if connection was successful by trying to ping
-    let tray_connected = tray_client.is_connected();
+    let tray_connected = tray_client.borrow().is_connected();
     if tray_connected {
         info!("Connected to tray helper");
     } else {
         warn!("Tray helper not available (tray icon won't be visible)");
     }
 
-    // Setup tray client event handler
-    if tray_connected {
-        let client = Rc::new(RefCell::new(tray_client));
+    // Setup tray client event handler - MUST store the timer to keep it alive
+    let _tray_timer = if tray_connected {
         let window_weak = main_window.as_weak();
-        let client_clone = Rc::clone(&client);
-        slint::Timer::default().start(
+        let client_clone = Rc::clone(&tray_client);
+        let timer = slint::Timer::default();
+        timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(100),
             move || {
                 if let Ok(mut c) = client_clone.try_borrow_mut() {
                     while let Some(cmd) = c.try_recv() {
+                        println!("MAIN APP: Received command: {:?}", cmd);
                         match cmd {
                             tray_helper::IpcCommand::ShowWindow => {
+                                println!("MAIN APP: ShowWindow command - attempting to show window");
                                 if let Some(window) = window_weak.upgrade() {
-                                    window.show().ok();
+                                    match window.show() {
+                                        Ok(_) => println!("MAIN APP: window.show() succeeded"),
+                                        Err(e) => println!("MAIN APP: window.show() failed: {:?}", e),
+                                    }
+                                } else {
+                                    println!("MAIN APP: window_weak.upgrade() returned None!");
                                 }
                             }
                             tray_helper::IpcCommand::Quit => {
@@ -149,11 +172,49 @@ fn main() -> Result<()> {
                 }
             },
         );
+        Some(timer)
+    } else {
+        None
+    };
+
+    // When user clicks X to close the window, check minimize_to_tray setting
+    // If tray connected AND minimize_to_tray enabled, hide window. Otherwise quit.
+    if tray_connected {
+        let window_weak = main_window.as_weak();
+        main_window.window().on_close_requested(move || {
+            if let Some(win) = window_weak.upgrade() {
+                if win.get_minimize_to_tray() {
+                    // Hide the window, don't quit - the app stays in the tray
+                    info!("Window close requested - hiding window (staying in tray)");
+                    slint::CloseRequestResponse::HideWindow
+                } else {
+                    // Quit the application
+                    info!("Window close requested - quitting application");
+                    slint::quit_event_loop().ok();
+                    slint::CloseRequestResponse::HideWindow
+                }
+            } else {
+                slint::CloseRequestResponse::HideWindow
+            }
+        });
     }
 
     // Run the GUI event loop
     info!("Starting GUI...");
-    main_window.run()?;
+    
+    // Show the main window first
+    main_window.show()?;
+    
+    // Use run_event_loop_until_quit() so the app keeps running even when all windows
+    // are hidden (minimized to tray). This only exits when quit_event_loop() is called.
+    slint::run_event_loop_until_quit()?;
+
+    // Notify tray helper to quit when main app exits
+    if tray_connected {
+        if let Ok(mut client) = tray_client.try_borrow_mut() {
+            client.quit();
+        }
+    }
 
     info!("RazerLinux shutting down");
     Ok(())
@@ -937,6 +998,7 @@ fn setup_callbacks(
             Ok(settings) => {
                 win.set_autostart_enabled(settings.autostart || settings::is_autostart_enabled());
                 win.set_default_profile(settings.default_profile.clone().into());
+                win.set_minimize_to_tray(settings.minimize_to_tray);
                 
                 // Load default profile on startup if specified
                 if !settings.default_profile.is_empty() {
@@ -1014,6 +1076,32 @@ fn setup_callbacks(
                 }
                 Err(e) => {
                     warn!("Failed to get profile list: {}", e);
+                }
+            }
+        }
+    });
+    
+    // Set minimize to tray callback
+    let window_weak = window.as_weak();
+    window.on_set_minimize_to_tray(move |enabled| {
+        info!("Setting minimize to tray: {}", enabled);
+        if let Some(win) = window_weak.upgrade() {
+            match AppSettings::load() {
+                Ok(mut settings) => {
+                    if let Err(e) = settings.set_minimize_to_tray(enabled) {
+                        error!("Failed to set minimize to tray: {}", e);
+                        win.set_status_message(format!("Failed to save setting: {}", e).into());
+                    } else {
+                        win.set_status_message(if enabled {
+                            "Will minimize to tray on close".into()
+                        } else {
+                            "Will quit on close".into()
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    win.set_status_message(format!("Settings error: {}", e).into());
                 }
             }
         }
@@ -1375,6 +1463,10 @@ fn load_profile_on_startup(
     device: &Rc<RefCell<Option<device::RazerDevice>>>,
     remap_mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
     macro_manager: &Rc<RefCell<macro_engine::MacroManager>>,
+    remapper: &Rc<RefCell<Option<remap::Remapper>>>,
+    dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
+    autoscroll_enabled: &Rc<RefCell<bool>>,
+    autoscroll_overlay: &Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
     profile_name: &str,
 ) {
     match ProfileManager::new() {
@@ -1420,6 +1512,13 @@ fn load_profile_on_startup(
                         mgr.load_from_profile(profile.macros.clone());
                         window.set_macro_list_text(mgr.get_macros_list_text().into());
                         window.set_available_macros(mgr.get_available_macros_string().into());
+                    }
+
+                    // Start the remapper if profile has it enabled
+                    if profile.remap.enabled {
+                        let autoscroll = *autoscroll_enabled.borrow();
+                        info!("Starting remapper from startup profile");
+                        start_remapper(window, device, remapper, remap_mappings, dpi_poller, autoscroll_overlay, autoscroll, macro_manager);
                     }
 
                     window.set_status_message(format!("Profile '{}' loaded!", profile_name).into());
