@@ -13,13 +13,22 @@ fi
 
 echo "Removing RazerLinux..."
 
+# Kill any running instances of RazerLinux
+echo "Stopping running instances..."
+pkill -f "razerlinux" 2>/dev/null || true
+sleep 0.5
+
 # Stop and disable systemd service for all users
+echo "Disabling systemd services..."
 for home_dir in /home/*; do
     if [ -d "$home_dir" ]; then
         username=$(basename "$home_dir")
-        # Try to disable the service (ignore errors if not enabled)
-        sudo -u "$username" systemctl --user stop razerlinux.service 2>/dev/null || true
-        sudo -u "$username" systemctl --user disable razerlinux.service 2>/dev/null || true
+        uid=$(id -u "$username" 2>/dev/null) || continue
+        # Run as user with proper XDG_RUNTIME_DIR
+        sudo -u "$username" env XDG_RUNTIME_DIR="/run/user/$uid" \
+            systemctl --user stop razerlinux.service 2>/dev/null || true
+        sudo -u "$username" env XDG_RUNTIME_DIR="/run/user/$uid" \
+            systemctl --user disable razerlinux.service 2>/dev/null || true
     fi
 done
 

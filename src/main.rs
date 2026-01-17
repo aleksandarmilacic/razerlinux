@@ -363,6 +363,7 @@ fn setup_callbacks(
             let dpi_y = win.get_current_dpi_y() as u16;
             let mut profile = Profile::from_device_settings(&name, dpi_x, dpi_y);
             profile.remap.enabled = win.get_remap_enabled();
+            profile.remap.autoscroll = win.get_autoscroll_enabled();
             profile.remap.mappings = remap_mappings_clone
                 .borrow()
                 .iter()
@@ -463,10 +464,14 @@ fn setup_callbacks(
                                 win.set_macro_list_text(mgr.get_macros_list_text().into());
                                 win.set_available_macros(mgr.get_available_macros_string().into());
                             }
+                            
+                            // Load autoscroll setting from profile
+                            *autoscroll_clone.borrow_mut() = profile.remap.autoscroll;
+                            win.set_autoscroll_enabled(profile.remap.autoscroll);
 
                             // Start/stop remapper to match profile
                             if profile.remap.enabled {
-                                let autoscroll = *autoscroll_clone.borrow();
+                                let autoscroll = profile.remap.autoscroll;
                                 start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll, &macro_mgr_clone);
                             } else {
                                 stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
