@@ -36,8 +36,11 @@ fn main() -> Result<()> {
         info!("Starting as tray helper...");
         return tray_helper::run_tray_helper();
     }
+    
+    // Check if we should start minimized (e.g., from systemd autostart)
+    let start_minimized = args.iter().any(|a| a == "--minimized" || a == "-m");
 
-    info!("RazerLinux starting...");
+    info!("RazerLinux starting{}", if start_minimized { " (minimized)" } else { "" });
 
     // If running under sudo, try to point DBus/XDG runtime to the user session
     if env::var("SUDO_UID").is_ok() {
@@ -202,8 +205,16 @@ fn main() -> Result<()> {
     // Run the GUI event loop
     info!("Starting GUI...");
     
-    // Show the main window first
-    main_window.show()?;
+    // Show the main window unless starting minimized (e.g., from systemd)
+    if start_minimized {
+        info!("Starting minimized to tray");
+        // Don't show the window - it will be hidden/in tray
+        // On first run, we still need to create the window but hide it immediately
+        main_window.show()?;
+        main_window.hide()?;
+    } else {
+        main_window.show()?;
+    }
     
     // Use run_event_loop_until_quit() so the app keeps running even when all windows
     // are hidden (minimized to tray). This only exits when quit_event_loop() is called.
@@ -218,6 +229,51 @@ fn main() -> Result<()> {
 
     info!("RazerLinux shutting down");
     Ok(())
+}
+
+/// Auto-save current state to the Default profile.
+/// This ensures settings persist across restarts without explicit save.
+fn auto_save_default_profile(
+    window: &MainWindow,
+    remap_mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+    macro_manager: &Rc<RefCell<macro_engine::MacroManager>>,
+) {
+    let dpi_x = window.get_current_dpi_x() as u16;
+    let dpi_y = window.get_current_dpi_y() as u16;
+    
+    let mut profile = Profile::from_device_settings("Default", dpi_x, dpi_y);
+    profile.description = "Auto-saved default profile".to_string();
+    profile.remap.enabled = window.get_remap_enabled();
+    profile.remap.autoscroll = window.get_autoscroll_enabled();
+    profile.remap.mappings = remap_mappings
+        .borrow()
+        .iter()
+        .map(|(s, t)| profile::RemapMapping {
+            source: *s,
+            target: t.base,
+            ctrl: t.mods.ctrl,
+            alt: t.mods.alt,
+            shift: t.mods.shift,
+            meta: t.mods.meta,
+            macro_id: None,
+        })
+        .collect();
+    
+    // Include macros
+    profile.macros = macro_manager.borrow().export_for_profile();
+    
+    match ProfileManager::new() {
+        Ok(manager) => {
+            if let Err(e) = manager.save_profile(&profile) {
+                warn!("Failed to auto-save Default profile: {}", e);
+            } else {
+                info!("Auto-saved Default profile");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to create profile manager for auto-save: {}", e);
+        }
+    }
 }
 
 fn connect_device(window: &MainWindow, device: &Rc<RefCell<Option<device::RazerDevice>>>) {
@@ -492,10 +548,12 @@ fn setup_callbacks(
     let device_clone = device.clone();
     let remapper_clone = remapper.clone();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
     let dpi_poller_clone = dpi_poller.clone();
     let autoscroll_clone = autoscroll_enabled.clone();
     let overlay_clone = autoscroll_overlay.clone();
     let macro_mgr_clone = macro_manager.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_remap_set_enabled(move |enabled| {
         if let Some(win) = window_weak.upgrade() {
             if enabled {
@@ -505,6 +563,8 @@ fn setup_callbacks(
                 stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                 win.set_status_message("Remapping disabled".into());
             }
+            // Auto-save state to Default profile
+            auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
         }
     });
 
@@ -514,9 +574,11 @@ fn setup_callbacks(
     let remapper_clone = remapper.clone();
     let device_clone = device.clone();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
     let dpi_poller_clone = dpi_poller.clone();
     let overlay_clone = autoscroll_overlay.clone();
     let macro_mgr_clone = macro_manager.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_autoscroll_set_enabled(move |enabled| {
         info!("Autoscroll set to: {}", enabled);
         *autoscroll_clone.borrow_mut() = enabled;
@@ -530,6 +592,11 @@ fn setup_callbacks(
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, enabled, &macro_mgr_clone);
             }
+        }
+        
+        // Auto-save state to Default profile
+        if let Some(win) = window_weak.upgrade() {
+            auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
         }
     });
 
@@ -590,6 +657,8 @@ fn setup_callbacks(
     // Add mapping
     let window_weak = window.as_weak();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_remap_add_mapping(move |source, target, ctrl, alt, shift, meta| {
         if let Some(win) = window_weak.upgrade() {
             let s = source as u16;
@@ -636,6 +705,9 @@ fn setup_callbacks(
                 false,
                 false,
             );
+            
+            // Auto-save to Default profile
+            auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
         }
     });
     
@@ -662,23 +734,31 @@ fn setup_callbacks(
     // Clear mappings
     let window_weak = window.as_weak();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_remap_clear(move || {
         if let Some(win) = window_weak.upgrade() {
             remap_mappings_clone.borrow_mut().clear();
             update_remap_summary(&win, &remap_mappings_clone.borrow());
             win.set_status_message("Mappings cleared".into());
+            // Auto-save to Default profile
+            auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
         }
     });
 
     // Remove a single mapping by source code
     let window_weak = window.as_weak();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_remap_remove_mapping(move |source| {
         if let Some(win) = window_weak.upgrade() {
             let s = source as u16;
             if remap_mappings_clone.borrow_mut().remove(&s).is_some() {
                 update_remap_summary(&win, &remap_mappings_clone.borrow());
                 win.set_status_message(format!("Removed mapping for button (code {})", s).into());
+                // Auto-save to Default profile
+                auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
             } else {
                 win.set_status_message(format!("No mapping found for code {}", s).into());
             }
@@ -1544,6 +1624,10 @@ fn load_profile_on_startup(
                     window.set_remap_enabled(profile.remap.enabled);
                     update_remap_summary(window, &remap_mappings.borrow());
                     
+                    // Load autoscroll setting from profile
+                    *autoscroll_enabled.borrow_mut() = profile.remap.autoscroll;
+                    window.set_autoscroll_enabled(profile.remap.autoscroll);
+                    
                     // Load macros from profile
                     {
                         let mut mgr = macro_manager.borrow_mut();
@@ -1554,8 +1638,8 @@ fn load_profile_on_startup(
 
                     // Start the remapper if profile has it enabled
                     if profile.remap.enabled {
-                        let autoscroll = *autoscroll_enabled.borrow();
-                        info!("Starting remapper from startup profile");
+                        let autoscroll = profile.remap.autoscroll;  // Use profile setting
+                        info!("Starting remapper from startup profile (autoscroll: {})", autoscroll);
                         start_remapper(window, device, remapper, remap_mappings, dpi_poller, autoscroll_overlay, autoscroll, macro_manager);
                     }
 
