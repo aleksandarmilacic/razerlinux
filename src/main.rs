@@ -12,12 +12,14 @@ mod protocol;
 mod remap;
 mod settings;
 mod tray;
+mod tray_helper;
 
 use anyhow::Result;
 use profile::{Profile, ProfileManager};
 use settings::AppSettings;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::env;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -28,7 +30,29 @@ fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
+    // Check if we should run as the tray helper (user-space process for system tray)
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--tray-helper") {
+        info!("Starting as tray helper...");
+        return tray_helper::run_tray_helper();
+    }
+
     info!("RazerLinux starting...");
+
+    // If running under sudo, try to point DBus/XDG runtime to the user session
+    if env::var("SUDO_UID").is_ok() {
+        if env::var("DBUS_SESSION_BUS_ADDRESS").is_err() {
+            if let Ok(uid) = env::var("SUDO_UID") {
+                let bus = format!("unix:path=/run/user/{}/bus", uid);
+                unsafe { env::set_var("DBUS_SESSION_BUS_ADDRESS", bus); }
+            }
+        }
+        if env::var("XDG_RUNTIME_DIR").is_err() {
+            if let Ok(uid) = env::var("SUDO_UID") {
+                unsafe { env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", uid)); }
+            }
+        }
+    }
     
     // Ensure the Default profile exists
     if let Err(e) = settings::ensure_default_profile_exists() {
@@ -87,34 +111,39 @@ fn main() -> Result<()> {
         }
     }
 
-    // Create system tray icon
-    let _tray = match tray::TrayIcon::new() {
-        Ok(tray) => {
-            info!("System tray icon created");
-            Some(tray)
-        }
-        Err(e) => {
-            warn!("Failed to create system tray icon: {}", e);
-            None
-        }
-    };
+    // Connect to the user-space tray helper process (which runs as the user and can show the tray icon)
+    // The tray helper is started by the launcher script before running pkexec
+    let tray_client = tray_helper::TrayClient::connect();
+    
+    // Check if connection was successful by trying to ping
+    let tray_connected = tray_client.is_connected();
+    if tray_connected {
+        info!("Connected to tray helper");
+    } else {
+        warn!("Tray helper not available (tray icon won't be visible)");
+    }
 
-    // Setup tray event handler if tray was created
-    if _tray.is_some() {
+    // Setup tray client event handler
+    if tray_connected {
+        let client = Rc::new(RefCell::new(tray_client));
         let window_weak = main_window.as_weak();
+        let client_clone = Rc::clone(&client);
         slint::Timer::default().start(
             slint::TimerMode::Repeated,
             Duration::from_millis(100),
             move || {
-                while let Some(cmd) = tray::try_recv_command() {
-                    match cmd {
-                        tray::TrayCommand::ShowWindow => {
-                            if let Some(window) = window_weak.upgrade() {
-                                window.show().ok();
+                if let Ok(mut c) = client_clone.try_borrow_mut() {
+                    while let Some(cmd) = c.try_recv() {
+                        match cmd {
+                            tray_helper::IpcCommand::ShowWindow => {
+                                if let Some(window) = window_weak.upgrade() {
+                                    window.show().ok();
+                                }
                             }
-                        }
-                        tray::TrayCommand::Quit => {
-                            slint::quit_event_loop().ok();
+                            tray_helper::IpcCommand::Quit => {
+                                slint::quit_event_loop().ok();
+                            }
+                            _ => {}
                         }
                     }
                 }

@@ -7,6 +7,8 @@ set -e
 INSTALL_DIR="/opt/razerlinux"
 BIN_NAME="razerlinux"
 DESKTOP_FILE="/usr/share/applications/razerlinux.desktop"
+ICON_DIR="/usr/share/icons/hicolor/scalable/apps"
+ICON_FILE="$ICON_DIR/razerlinux.svg"
 UDEV_RULES="/etc/udev/rules.d/99-razerlinux.rules"
 POLKIT_RULE="/usr/share/polkit-1/actions/org.razerlinux.policy"
 
@@ -26,15 +28,43 @@ REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 echo "Installing for user: $REAL_USER"
 echo ""
 
-# Build release version
-echo "[1/6] Building release version..."
+# Parse CLI flags (fallback to env)
+BUILD_PROFILE="${BUILD_PROFILE:-release}"
+if [ "$1" = "--debug" ]; then
+  BUILD_PROFILE="debug"
+fi
+if [ "$1" = "--release" ]; then
+  BUILD_PROFILE="release"
+fi
+if [ "$1" = "--skip-build" ] || [ "$2" = "--skip-build" ]; then
+  SKIP_BUILD=1
+fi
+
+# Build version (can be skipped with SKIP_BUILD=1)
+echo "[1/6] Building ${BUILD_PROFILE} version..."
 cd "$(dirname "$0")"
-sudo -u "$REAL_USER" cargo build --release
+if [ "$BUILD_PROFILE" = "debug" ]; then
+  BUILD_CMD="cargo build"
+  BIN_PATH="target/debug/$BIN_NAME"
+else
+  BUILD_CMD="cargo build --release"
+  BIN_PATH="target/release/$BIN_NAME"
+fi
+
+if [ -z "$SKIP_BUILD" ]; then
+  sudo -u "$REAL_USER" $BUILD_CMD
+else
+  echo "SKIP_BUILD=1 set, using existing binary"
+fi
 
 # Create installation directory
 echo "[2/6] Creating installation directory..."
 mkdir -p "$INSTALL_DIR"
-cp target/release/$BIN_NAME "$INSTALL_DIR/"
+if [ ! -f "$BIN_PATH" ]; then
+  echo "ERROR: $BIN_PATH not found. Build first or unset SKIP_BUILD."
+  exit 1
+fi
+cp "$BIN_PATH" "$INSTALL_DIR/"
 chmod 755 "$INSTALL_DIR/$BIN_NAME"
 
 # Install udev rules for non-root HID access
@@ -83,15 +113,35 @@ EOF
 echo "[5/6] Creating launcher wrapper..."
 cat > "$INSTALL_DIR/razerlinux-launcher" << 'EOF'
 #!/bin/bash
-# RazerLinux launcher with privilege escalation
+# RazerLinux launcher with privilege escalation and tray helper
+
+# Cleanup function to stop tray helper when main app exits
+cleanup() {
+    if [ -n "$TRAY_PID" ]; then
+        kill "$TRAY_PID" 2>/dev/null
+    fi
+}
+trap cleanup EXIT
+
+# Start the tray helper as the current user (runs in user session for tray icon)
+# The tray helper creates a Unix socket for IPC with the main app
+/opt/razerlinux/razerlinux --tray-helper &
+TRAY_PID=$!
+
+# Give the tray helper time to start and create the socket
+sleep 0.3
 
 # Check if udev rules allow non-root access
 if [ -r /dev/hidraw0 ] 2>/dev/null; then
     # Can access hidraw without root, run directly
     /opt/razerlinux/razerlinux "$@"
 else
-    # Need elevated privileges
-    pkexec env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" /opt/razerlinux/razerlinux "$@"
+    # Need elevated privileges - pass XDG_RUNTIME_DIR for socket path
+    pkexec env \
+        DISPLAY="$DISPLAY" \
+        XAUTHORITY="$XAUTHORITY" \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        /opt/razerlinux/razerlinux "$@"
 fi
 EOF
 chmod 755 "$INSTALL_DIR/razerlinux-launcher"
@@ -100,13 +150,15 @@ chmod 755 "$INSTALL_DIR/razerlinux-launcher"
 ln -sf "$INSTALL_DIR/razerlinux-launcher" /usr/local/bin/razerlinux
 
 # Create desktop entry
-echo "[6/6] Creating desktop entry..."
+echo "[6/6] Installing icon and desktop entry..."
+mkdir -p "$ICON_DIR"
+cp "$(dirname "$0")/assets/razerlinux.svg" "$ICON_FILE"
 cat > "$DESKTOP_FILE" << EOF
 [Desktop Entry]
 Name=RazerLinux
 Comment=Razer Mouse Configuration Tool
 Exec=/usr/local/bin/razerlinux
-Icon=input-mouse
+Icon=razerlinux
 Terminal=false
 Type=Application
 Categories=Settings;HardwareSettings;

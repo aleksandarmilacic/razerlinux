@@ -18,6 +18,7 @@ rm -f /usr/local/bin/razerlinux
 rm -f /usr/share/applications/razerlinux.desktop
 rm -f /etc/udev/rules.d/99-razerlinux.rules
 rm -f /usr/share/polkit-1/actions/org.razerlinux.policy
+rm -f /usr/share/icons/hicolor/scalable/apps/razerlinux.svg
 rm -rf /opt/razerlinux
 
 # Remove autostart entries (for all users)

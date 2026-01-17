@@ -44,6 +44,7 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 # System tray icon
 tray-icon = "0.19"
 image = { version = "0.25", default-features = false, features = ["png"] }
+ksni = "0.2"
 
 [build-dependencies]
 slint-build = "1"
