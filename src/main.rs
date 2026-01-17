@@ -205,41 +205,15 @@ fn main() -> Result<()> {
     // Run the GUI event loop
     info!("Starting GUI...");
     
-    // Always show the window first (required for event loop to start)
-    main_window.show()?;
-    
-    // If starting minimized with tray connected, trigger close request after startup
-    // This will invoke on_close_requested which returns HideWindow (same as pressing X)
+    // If starting minimized with tray connected, don't show window at all
+    // The tray icon click will call window.show() when user wants to see it
     if start_minimized && tray_connected {
-        info!("Will hide to tray after startup (via close request)");
-        let hide_timer = slint::Timer::default();
-        hide_timer.start(
-            slint::TimerMode::SingleShot,
-            Duration::from_millis(1500),
-            move || {
-                info!("Timer fired - sending close request to hide window");
-                // Use xdotool windowclose to trigger on_close_requested callback
-                // This simulates pressing the X button, which hides to tray
-                match std::process::Command::new("sh")
-                    .args(["-c", "xdotool search --name 'RazerLinux' | head -1 | xargs -I{} xdotool windowclose {}"])
-                    .output() 
-                {
-                    Ok(output) => {
-                        if output.status.success() {
-                            info!("Sent close request to window (will hide to tray)");
-                        } else {
-                            warn!("xdotool windowclose failed: {:?}", String::from_utf8_lossy(&output.stderr));
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to run xdotool: {}", e);
-                    }
-                }
-            },
-        );
-        Box::leak(Box::new(hide_timer));
-    } else if start_minimized {
-        info!("Requested minimized start but no tray helper - staying visible");
+        info!("Starting hidden to tray (window not shown)");
+        // We still need to "show" internally for Slint, but hide immediately
+        // Actually, Slint's run_event_loop_until_quit works without showing
+    } else {
+        // Normal startup - show the window
+        main_window.show()?;
     }
     
     // Use run_event_loop_until_quit() so the app keeps running even when all windows
