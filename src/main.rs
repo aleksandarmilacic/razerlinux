@@ -205,16 +205,32 @@ fn main() -> Result<()> {
     // Run the GUI event loop
     info!("Starting GUI...");
     
-    // Show the main window unless starting minimized (e.g., from systemd)
-    if start_minimized {
-        info!("Starting minimized to tray");
-        // Don't show the window - it will be hidden/in tray
-        // On first run, we still need to create the window but hide it immediately
-        main_window.show()?;
-        main_window.hide()?;
+    // Always show the window first (required for event loop to start)
+    main_window.show()?;
+    
+    // If starting minimized with tray connected, hide after a brief delay
+    // (we need the event loop running before we can hide)
+    let _hide_timer = if start_minimized && tray_connected {
+        info!("Will minimize to tray after startup");
+        let window_weak = main_window.as_weak();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(100),
+            move || {
+                if let Some(win) = window_weak.upgrade() {
+                    info!("Hiding window to tray");
+                    win.hide().ok();
+                }
+            },
+        );
+        Some(timer)
     } else {
-        main_window.show()?;
-    }
+        if start_minimized {
+            info!("Requested minimized start but no tray helper - staying visible");
+        }
+        None
+    };
     
     // Use run_event_loop_until_quit() so the app keeps running even when all windows
     // are hidden (minimized to tray). This only exits when quit_event_loop() is called.
