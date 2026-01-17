@@ -11,6 +11,7 @@ ICON_DIR="/usr/share/icons/hicolor/scalable/apps"
 ICON_FILE="$ICON_DIR/razerlinux.svg"
 UDEV_RULES="/etc/udev/rules.d/99-razerlinux.rules"
 POLKIT_RULE="/usr/share/polkit-1/actions/org.razerlinux.policy"
+SYSTEMD_USER_DIR="/usr/lib/systemd/user"
 
 echo "=== RazerLinux Installer ==="
 echo ""
@@ -30,15 +31,15 @@ echo ""
 
 # Parse CLI flags (fallback to env)
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
-if [ "$1" = "--debug" ]; then
-  BUILD_PROFILE="debug"
-fi
-if [ "$1" = "--release" ]; then
-  BUILD_PROFILE="release"
-fi
-if [ "$1" = "--skip-build" ] || [ "$2" = "--skip-build" ]; then
-  SKIP_BUILD=1
-fi
+USE_SYSTEMD=0
+for arg in "$@"; do
+  case "$arg" in
+    --debug) BUILD_PROFILE="debug" ;;
+    --release) BUILD_PROFILE="release" ;;
+    --skip-build) SKIP_BUILD=1 ;;
+    --systemd) USE_SYSTEMD=1 ;;
+  esac
+done
 
 # Build version (can be skipped with SKIP_BUILD=1)
 echo "[1/6] Building ${BUILD_PROFILE} version..."
@@ -150,7 +151,7 @@ chmod 755 "$INSTALL_DIR/razerlinux-launcher"
 ln -sf "$INSTALL_DIR/razerlinux-launcher" /usr/local/bin/razerlinux
 
 # Create desktop entry
-echo "[6/6] Installing icon and desktop entry..."
+echo "[6/7] Installing icon and desktop entry..."
 mkdir -p "$ICON_DIR"
 cp "$(dirname "$0")/assets/razerlinux.svg" "$ICON_FILE"
 cat > "$DESKTOP_FILE" << EOF
@@ -166,11 +167,25 @@ Keywords=razer;mouse;gaming;dpi;macro;
 StartupNotify=true
 EOF
 
+# Install systemd user service (optional)
+echo "[7/7] Installing systemd user service..."
+mkdir -p "$SYSTEMD_USER_DIR"
+cp "$(dirname "$0")/assets/razerlinux.service" "$SYSTEMD_USER_DIR/"
+
 # Reload udev rules
 echo ""
 echo "Reloading udev rules..."
 udevadm control --reload-rules
 udevadm trigger
+
+# Enable systemd service if requested
+if [ "$USE_SYSTEMD" = "1" ]; then
+    echo ""
+    echo "Enabling systemd user service for $REAL_USER..."
+    sudo -u "$REAL_USER" systemctl --user daemon-reload
+    sudo -u "$REAL_USER" systemctl --user enable razerlinux.service
+    echo "Systemd service enabled. It will start on next login."
+fi
 
 echo ""
 echo "=== Installation Complete ==="
@@ -183,7 +198,8 @@ echo "To run RazerLinux:"
 echo "  - From terminal: razerlinux"
 echo "  - From app menu: Search for 'RazerLinux'"
 echo ""
-echo "To enable autostart:"
-echo "  - Open RazerLinux → Settings → Enable 'Start on system startup'"
+echo "Autostart options:"
+echo "  1. GUI: Open RazerLinux → Settings → Enable 'Start on system startup'"
+echo "  2. Systemd: systemctl --user enable razerlinux.service"
 echo ""
 echo "To uninstall: sudo /opt/razerlinux/uninstall.sh"

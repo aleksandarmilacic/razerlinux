@@ -181,6 +181,8 @@ export component MainWindow inherits Window {
     
     // Settings properties
     in-out property <bool> autostart-enabled: false;
+    in-out property <bool> systemd-enabled: false;  // Systemd user service autostart
+    in-out property <bool> systemd-available: false;  // Whether systemd service is installed
     in-out property <string> default-profile: "";
     in-out property <[string]> profile-list: [];  // List of available profiles
     in-out property <bool> minimize-to-tray: true;  // Minimize to tray on close
@@ -214,7 +216,8 @@ export component MainWindow inherits Window {
     callback clear-macro-focus();  // Clear focus from input fields when recording
     
     // Settings callbacks
-    callback set-autostart(bool);  // Enable/disable autostart
+    callback set-autostart(bool);  // Enable/disable autostart (desktop file)
+    callback set-systemd-autostart(bool);  // Enable/disable systemd user service
     callback set-default-profile(string);  // Set default profile to load on startup
     callback set-minimize-to-tray(bool);  // Enable/disable minimize to tray on close
     callback refresh-profile-list();  // Refresh list of available profiles
@@ -1630,9 +1633,35 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     Text {
-                                        text: "Start RazerLinux on system startup";
+                                        text: "Start on login (desktop autostart)";
                                         color: #e0e0e0;
                                         font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                
+                                // Systemd autostart (if available)
+                                if systemd-available: HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    
+                                    CheckBox {
+                                        checked: systemd-enabled;
+                                        toggled => { 
+                                            systemd-enabled = self.checked;
+                                            set-systemd-autostart(self.checked); 
+                                        }
+                                    }
+                                    Text {
+                                        text: "Systemd user service (auto-restart)";
+                                        color: #e0e0e0;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: "recommended";
+                                        color: #22c55e;
+                                        font-size: 10px;
                                         vertical-alignment: center;
                                     }
                                 }

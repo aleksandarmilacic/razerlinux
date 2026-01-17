@@ -1000,6 +1000,10 @@ fn setup_callbacks(
                 win.set_default_profile(settings.default_profile.clone().into());
                 win.set_minimize_to_tray(settings.minimize_to_tray);
                 
+                // Systemd user service status
+                win.set_systemd_available(settings::is_systemd_available());
+                win.set_systemd_enabled(settings::is_systemd_enabled());
+                
                 // Load default profile on startup if specified
                 if !settings.default_profile.is_empty() {
                     info!("Loading default profile: {}", settings.default_profile);
@@ -1033,6 +1037,35 @@ fn setup_callbacks(
                 Err(e) => {
                     error!("Failed to load settings: {}", e);
                     win.set_status_message(format!("Settings error: {}", e).into());
+                }
+            }
+        }
+    });
+    
+    // Set systemd autostart callback
+    let window_weak = window.as_weak();
+    window.on_set_systemd_autostart(move |enabled| {
+        info!("Setting systemd autostart: {}", enabled);
+        if let Some(win) = window_weak.upgrade() {
+            let result = if enabled {
+                settings::enable_systemd_service()
+            } else {
+                settings::disable_systemd_service()
+            };
+            
+            match result {
+                Ok(()) => {
+                    win.set_status_message(if enabled {
+                        "Systemd autostart enabled".into()
+                    } else {
+                        "Systemd autostart disabled".into()
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to set systemd autostart: {}", e);
+                    win.set_status_message(format!("Failed: {}", e).into());
+                    // Revert the checkbox
+                    win.set_systemd_enabled(!enabled);
                 }
             }
         }

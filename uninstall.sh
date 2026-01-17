@@ -13,12 +13,23 @@ fi
 
 echo "Removing RazerLinux..."
 
+# Stop and disable systemd service for all users
+for home_dir in /home/*; do
+    if [ -d "$home_dir" ]; then
+        username=$(basename "$home_dir")
+        # Try to disable the service (ignore errors if not enabled)
+        sudo -u "$username" systemctl --user stop razerlinux.service 2>/dev/null || true
+        sudo -u "$username" systemctl --user disable razerlinux.service 2>/dev/null || true
+    fi
+done
+
 # Remove files
 rm -f /usr/local/bin/razerlinux
 rm -f /usr/share/applications/razerlinux.desktop
 rm -f /etc/udev/rules.d/99-razerlinux.rules
 rm -f /usr/share/polkit-1/actions/org.razerlinux.policy
 rm -f /usr/share/icons/hicolor/scalable/apps/razerlinux.svg
+rm -f /usr/lib/systemd/user/razerlinux.service
 rm -rf /opt/razerlinux
 
 # Remove autostart entries (for all users)

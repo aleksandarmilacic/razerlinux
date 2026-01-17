@@ -165,6 +165,65 @@ pub fn is_autostart_enabled() -> bool {
         .unwrap_or(false)
 }
 
+// ============ Systemd User Service Control ============
+
+/// Check if systemd user service is enabled
+pub fn is_systemd_enabled() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "razerlinux.service"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if systemd user service is available (installed)
+pub fn is_systemd_available() -> bool {
+    std::path::Path::new("/usr/lib/systemd/user/razerlinux.service").exists()
+        || std::path::Path::new("/etc/systemd/user/razerlinux.service").exists()
+}
+
+/// Enable the systemd user service
+pub fn enable_systemd_service() -> Result<()> {
+    if !is_systemd_available() {
+        anyhow::bail!("Systemd service not installed. Reinstall with: sudo ./install.sh");
+    }
+    
+    // Reload daemon to pick up any changes
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output();
+    
+    // Enable the service
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "razerlinux.service"])
+        .output()
+        .context("Failed to run systemctl")?;
+    
+    if output.status.success() {
+        info!("Systemd user service enabled");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to enable systemd service: {}", stderr)
+    }
+}
+
+/// Disable the systemd user service
+pub fn disable_systemd_service() -> Result<()> {
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "disable", "razerlinux.service"])
+        .output()
+        .context("Failed to run systemctl")?;
+    
+    if output.status.success() {
+        info!("Systemd user service disabled");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to disable systemd service: {}", stderr)
+    }
+}
+
 /// Get list of available profile names
 pub fn get_profile_list() -> Result<Vec<String>> {
     let profile_dir = dirs::config_dir()
