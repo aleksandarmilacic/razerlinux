@@ -208,30 +208,35 @@ fn main() -> Result<()> {
     // Always show the window first (required for event loop to start)
     main_window.show()?;
     
-    // If starting minimized with tray connected, schedule hide after event loop starts
+    // If starting minimized with tray connected, trigger close request after startup
+    // This will invoke on_close_requested which returns HideWindow (same as pressing X)
     if start_minimized && tray_connected {
-        info!("Will minimize to tray after startup");
-        let window_weak = main_window.as_weak();
-        // Use a timer that lives as long as the app does
+        info!("Will hide to tray after startup (via close request)");
         let hide_timer = slint::Timer::default();
         hide_timer.start(
             slint::TimerMode::SingleShot,
-            Duration::from_millis(800),  // Give window time to fully render
+            Duration::from_millis(1500),
             move || {
-                info!("Timer fired - hiding window to tray");
-                if let Some(win) = window_weak.upgrade() {
-                    if let Err(e) = win.window().hide() {
-                        error!("Failed to hide window: {:?}", e);
-                    } else {
-                        info!("Window hidden successfully");
+                info!("Timer fired - sending close request to hide window");
+                // Use xdotool windowclose to trigger on_close_requested callback
+                // This simulates pressing the X button, which hides to tray
+                match std::process::Command::new("sh")
+                    .args(["-c", "xdotool search --name 'RazerLinux' | head -1 | xargs -I{} xdotool windowclose {}"])
+                    .output() 
+                {
+                    Ok(output) => {
+                        if output.status.success() {
+                            info!("Sent close request to window (will hide to tray)");
+                        } else {
+                            warn!("xdotool windowclose failed: {:?}", String::from_utf8_lossy(&output.stderr));
+                        }
                     }
-                } else {
-                    error!("Could not upgrade window weak reference");
+                    Err(e) => {
+                        warn!("Failed to run xdotool: {}", e);
+                    }
                 }
             },
         );
-        // Store timer in a Box to keep it alive for the duration of the event loop
-        // The timer is moved into a static context via leak to prevent dropping
         Box::leak(Box::new(hide_timer));
     } else if start_minimized {
         info!("Requested minimized start but no tray helper - staying visible");
