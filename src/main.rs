@@ -208,29 +208,34 @@ fn main() -> Result<()> {
     // Always show the window first (required for event loop to start)
     main_window.show()?;
     
-    // If starting minimized with tray connected, hide after a brief delay
-    // (we need the event loop running before we can hide)
-    let _hide_timer = if start_minimized && tray_connected {
+    // If starting minimized with tray connected, schedule hide after event loop starts
+    if start_minimized && tray_connected {
         info!("Will minimize to tray after startup");
         let window_weak = main_window.as_weak();
-        let timer = slint::Timer::default();
-        timer.start(
+        // Use a timer that lives as long as the app does
+        let hide_timer = slint::Timer::default();
+        hide_timer.start(
             slint::TimerMode::SingleShot,
-            Duration::from_millis(100),
+            Duration::from_millis(800),  // Give window time to fully render
             move || {
+                info!("Timer fired - hiding window to tray");
                 if let Some(win) = window_weak.upgrade() {
-                    info!("Hiding window to tray");
-                    win.hide().ok();
+                    if let Err(e) = win.window().hide() {
+                        error!("Failed to hide window: {:?}", e);
+                    } else {
+                        info!("Window hidden successfully");
+                    }
+                } else {
+                    error!("Could not upgrade window weak reference");
                 }
             },
         );
-        Some(timer)
-    } else {
-        if start_minimized {
-            info!("Requested minimized start but no tray helper - staying visible");
-        }
-        None
-    };
+        // Store timer in a Box to keep it alive for the duration of the event loop
+        // The timer is moved into a static context via leak to prevent dropping
+        Box::leak(Box::new(hide_timer));
+    } else if start_minimized {
+        info!("Requested minimized start but no tray helper - staying visible");
+    }
     
     // Use run_event_loop_until_quit() so the app keeps running even when all windows
     // are hidden (minimized to tray). This only exits when quit_event_loop() is called.
