@@ -2,5 +2,10 @@
 // Compiles Slint UI files
 
 fn main() {
-    slint_build::compile("ui/main.slint").unwrap();
+    // Use cosmic (dark) style for proper dark theme support
+    slint_build::compile_with_config(
+        "ui/main.slint",
+        slint_build::CompilerConfiguration::new()
+            .with_style("cosmic".into())
+    ).unwrap();
 }

@@ -1,0 +1,17 @@
+[Unit]
+Description=RazerLinux Mouse Configuration Tool
+Documentation=https://github.com/aleksandarmilacic/razerlinux
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/razerlinux/razerlinux-launcher --minimized
+Restart=on-failure
+RestartSec=5
+
+# Environment for GUI applications
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=graphical-session.target

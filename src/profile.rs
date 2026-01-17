@@ -32,6 +32,10 @@ pub struct Profile {
     /// Software remapping settings (evdev/uinput)
     #[serde(default)]
     pub remap: RemapSettings,
+    
+    /// Macro definitions
+    #[serde(default)]
+    pub macros: Vec<Macro>,
 }
 
 fn default_polling_rate() -> u16 {
@@ -71,6 +75,7 @@ impl Default for Profile {
             polling_rate: 1000,
             brightness: 255,
             remap: RemapSettings::default(),
+            macros: Vec::new(),
         }
     }
 }
@@ -97,6 +102,7 @@ impl Profile {
             polling_rate: 1000,
             brightness: 255,
             remap: RemapSettings::default(),
+            macros: Vec::new(),
         }
     }
 }
@@ -155,6 +161,18 @@ pub struct MacroAction {
     /// Delay in milliseconds for delay actions
     #[serde(default)]
     pub delay_ms: Option<u32>,
+}
+
+impl MacroAction {
+    /// Format as a display string for UI
+    pub fn to_display_string(&self) -> String {
+        match self.action_type {
+            MacroActionType::KeyPress => format!("↓ KEY_{}", self.key_code.unwrap_or(0)),
+            MacroActionType::KeyRelease => format!("↑ KEY_{}", self.key_code.unwrap_or(0)),
+            MacroActionType::Delay => format!("⏱ {}ms", self.delay_ms.unwrap_or(0)),
+            MacroActionType::MouseClick => format!("🖱 BTN_{}", self.key_code.unwrap_or(0)),
+        }
+    }
 }
 
 /// Type of macro action

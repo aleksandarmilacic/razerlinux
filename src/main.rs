@@ -5,15 +5,21 @@
 
 mod device;
 mod hidpoll;
+mod macro_engine;
 mod overlay;
 mod profile;
 mod protocol;
 mod remap;
+mod settings;
+mod tray;
+mod tray_helper;
 
 use anyhow::Result;
 use profile::{Profile, ProfileManager};
+use settings::AppSettings;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::env;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -24,7 +30,37 @@ fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
-    info!("RazerLinux starting...");
+    // Check if we should run as the tray helper (user-space process for system tray)
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--tray-helper") {
+        info!("Starting as tray helper...");
+        return tray_helper::run_tray_helper();
+    }
+    
+    // Check if we should start minimized (e.g., from systemd autostart)
+    let start_minimized = args.iter().any(|a| a == "--minimized" || a == "-m");
+
+    info!("RazerLinux starting{}", if start_minimized { " (minimized)" } else { "" });
+
+    // If running under sudo, try to point DBus/XDG runtime to the user session
+    if env::var("SUDO_UID").is_ok() {
+        if env::var("DBUS_SESSION_BUS_ADDRESS").is_err() {
+            if let Ok(uid) = env::var("SUDO_UID") {
+                let bus = format!("unix:path=/run/user/{}/bus", uid);
+                unsafe { env::set_var("DBUS_SESSION_BUS_ADDRESS", bus); }
+            }
+        }
+        if env::var("XDG_RUNTIME_DIR").is_err() {
+            if let Ok(uid) = env::var("SUDO_UID") {
+                unsafe { env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", uid)); }
+            }
+        }
+    }
+    
+    // Ensure the Default profile exists
+    if let Err(e) = settings::ensure_default_profile_exists() {
+        warn!("Failed to ensure default profile: {}", e);
+    }
 
     // Log all detected Razer input interfaces for debugging
     let interfaces = remap::list_razer_input_interfaces();
@@ -60,19 +96,184 @@ fn main() -> Result<()> {
     
     // DPI button poller - polls hidraw for DPI button presses and injects F13/F14 events
     let dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>> = Rc::new(RefCell::new(None));
+    
+    // Macro manager for recording and playback
+    let macro_manager: Rc<RefCell<macro_engine::MacroManager>> = Rc::new(RefCell::new(macro_engine::MacroManager::new()));
 
     // Try to find and connect to device on startup
     connect_device(&main_window, &device);
 
+    // Clone refs for use after setup_callbacks (which takes ownership)
+    let remapper_for_startup = remapper.clone();
+    let dpi_poller_for_startup = dpi_poller.clone();
+    let autoscroll_for_startup = autoscroll_enabled.clone();
+    let overlay_for_startup = autoscroll_overlay.clone();
+
     // Setup callbacks
-    setup_callbacks(&main_window, device, remapper, remap_mappings, dpi_poller, autoscroll_enabled, autoscroll_overlay);
+    setup_callbacks(&main_window, device.clone(), remapper, remap_mappings.clone(), dpi_poller, autoscroll_enabled, autoscroll_overlay, macro_manager.clone());
+    
+    // Load default profile on startup if configured
+    if let Ok(settings) = AppSettings::load() {
+        if !settings.default_profile.is_empty() {
+            info!("Loading default profile on startup: {}", settings.default_profile);
+            load_profile_on_startup(
+                &main_window, 
+                &device, 
+                &remap_mappings, 
+                &macro_manager,
+                &remapper_for_startup,
+                &dpi_poller_for_startup,
+                &autoscroll_for_startup,
+                &overlay_for_startup,
+                &settings.default_profile
+            );
+        }
+    }
+
+    // Connect to the user-space tray helper process (which runs as the user and can show the tray icon)
+    // The tray helper is started by the launcher script before running pkexec
+    let tray_client = Rc::new(RefCell::new(tray_helper::TrayClient::connect()));
+    
+    // Check if connection was successful by trying to ping
+    let tray_connected = tray_client.borrow().is_connected();
+    if tray_connected {
+        info!("Connected to tray helper");
+    } else {
+        warn!("Tray helper not available (tray icon won't be visible)");
+    }
+
+    // Setup tray client event handler - MUST store the timer to keep it alive
+    let _tray_timer = if tray_connected {
+        let window_weak = main_window.as_weak();
+        let client_clone = Rc::clone(&tray_client);
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(100),
+            move || {
+                if let Ok(mut c) = client_clone.try_borrow_mut() {
+                    while let Some(cmd) = c.try_recv() {
+                        println!("MAIN APP: Received command: {:?}", cmd);
+                        match cmd {
+                            tray_helper::IpcCommand::ShowWindow => {
+                                println!("MAIN APP: ShowWindow command - attempting to show window");
+                                if let Some(window) = window_weak.upgrade() {
+                                    match window.show() {
+                                        Ok(_) => println!("MAIN APP: window.show() succeeded"),
+                                        Err(e) => println!("MAIN APP: window.show() failed: {:?}", e),
+                                    }
+                                } else {
+                                    println!("MAIN APP: window_weak.upgrade() returned None!");
+                                }
+                            }
+                            tray_helper::IpcCommand::Quit => {
+                                slint::quit_event_loop().ok();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            },
+        );
+        Some(timer)
+    } else {
+        None
+    };
+
+    // When user clicks X to close the window, check minimize_to_tray setting
+    // If tray connected AND minimize_to_tray enabled, hide window. Otherwise quit.
+    if tray_connected {
+        let window_weak = main_window.as_weak();
+        main_window.window().on_close_requested(move || {
+            if let Some(win) = window_weak.upgrade() {
+                if win.get_minimize_to_tray() {
+                    // Hide the window, don't quit - the app stays in the tray
+                    info!("Window close requested - hiding window (staying in tray)");
+                    slint::CloseRequestResponse::HideWindow
+                } else {
+                    // Quit the application
+                    info!("Window close requested - quitting application");
+                    slint::quit_event_loop().ok();
+                    slint::CloseRequestResponse::HideWindow
+                }
+            } else {
+                slint::CloseRequestResponse::HideWindow
+            }
+        });
+    }
 
     // Run the GUI event loop
     info!("Starting GUI...");
-    main_window.run()?;
+    
+    // If starting minimized with tray connected, don't show window at all
+    // The tray icon click will call window.show() when user wants to see it
+    if start_minimized && tray_connected {
+        info!("Starting hidden to tray (window not shown)");
+        // We still need to "show" internally for Slint, but hide immediately
+        // Actually, Slint's run_event_loop_until_quit works without showing
+    } else {
+        // Normal startup - show the window
+        main_window.show()?;
+    }
+    
+    // Use run_event_loop_until_quit() so the app keeps running even when all windows
+    // are hidden (minimized to tray). This only exits when quit_event_loop() is called.
+    slint::run_event_loop_until_quit()?;
+
+    // Notify tray helper to quit when main app exits
+    if tray_connected {
+        if let Ok(mut client) = tray_client.try_borrow_mut() {
+            client.quit();
+        }
+    }
 
     info!("RazerLinux shutting down");
     Ok(())
+}
+
+/// Auto-save current state to the Default profile.
+/// This ensures settings persist across restarts without explicit save.
+fn auto_save_default_profile(
+    window: &MainWindow,
+    remap_mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+    macro_manager: &Rc<RefCell<macro_engine::MacroManager>>,
+) {
+    let dpi_x = window.get_current_dpi_x() as u16;
+    let dpi_y = window.get_current_dpi_y() as u16;
+    
+    let mut profile = Profile::from_device_settings("Default", dpi_x, dpi_y);
+    profile.description = "Auto-saved default profile".to_string();
+    profile.remap.enabled = window.get_remap_enabled();
+    profile.remap.autoscroll = window.get_autoscroll_enabled();
+    profile.remap.mappings = remap_mappings
+        .borrow()
+        .iter()
+        .map(|(s, t)| profile::RemapMapping {
+            source: *s,
+            target: t.base,
+            ctrl: t.mods.ctrl,
+            alt: t.mods.alt,
+            shift: t.mods.shift,
+            meta: t.mods.meta,
+            macro_id: None,
+        })
+        .collect();
+    
+    // Include macros
+    profile.macros = macro_manager.borrow().export_for_profile();
+    
+    match ProfileManager::new() {
+        Ok(manager) => {
+            if let Err(e) = manager.save_profile(&profile) {
+                warn!("Failed to auto-save Default profile: {}", e);
+            } else {
+                info!("Auto-saved Default profile");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to create profile manager for auto-save: {}", e);
+        }
+    }
 }
 
 fn connect_device(window: &MainWindow, device: &Rc<RefCell<Option<device::RazerDevice>>>) {
@@ -158,6 +359,7 @@ fn setup_callbacks(
     dpi_poller: Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
     autoscroll_enabled: Rc<RefCell<bool>>,
     autoscroll_overlay: Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
+    macro_manager: Rc<RefCell<macro_engine::MacroManager>>,
 ) {
     // Apply DPI callback
     let device_clone = device.clone();
@@ -202,6 +404,7 @@ fn setup_callbacks(
     // Save profile callback
     let remap_mappings_clone = remap_mappings.clone();
     let remapper_clone = remapper.clone();
+    let macro_mgr_clone = macro_manager.clone();
     let window_weak = window.as_weak();
     window.on_save_profile(move |profile_name| {
         info!("Saving profile: {}", profile_name);
@@ -216,6 +419,7 @@ fn setup_callbacks(
             let dpi_y = win.get_current_dpi_y() as u16;
             let mut profile = Profile::from_device_settings(&name, dpi_x, dpi_y);
             profile.remap.enabled = win.get_remap_enabled();
+            profile.remap.autoscroll = win.get_autoscroll_enabled();
             profile.remap.mappings = remap_mappings_clone
                 .borrow()
                 .iter()
@@ -229,6 +433,9 @@ fn setup_callbacks(
                     macro_id: None,
                 })
                 .collect();
+                
+            // Include macros in the profile
+            profile.macros = macro_mgr_clone.borrow().export_for_profile();
 
             // If remapping is currently active, store the detected/selected device if any.
             if profile.remap.enabled {
@@ -258,6 +465,7 @@ fn setup_callbacks(
     let dpi_poller_clone = dpi_poller.clone();
     let autoscroll_clone = autoscroll_enabled.clone();
     let overlay_clone = autoscroll_overlay.clone();
+    let macro_mgr_clone = macro_manager.clone();
     let window_weak = window.as_weak();
     window.on_load_profile(move |profile_name| {
         info!("Loading profile: {}", profile_name);
@@ -304,11 +512,23 @@ fn setup_callbacks(
                             }
                             win.set_remap_enabled(profile.remap.enabled);
                             update_remap_summary(&win, &remap_mappings_clone.borrow());
+                            
+                            // Load macros from profile
+                            {
+                                let mut mgr = macro_mgr_clone.borrow_mut();
+                                mgr.load_from_profile(profile.macros.clone());
+                                win.set_macro_list_text(mgr.get_macros_list_text().into());
+                                win.set_available_macros(mgr.get_available_macros_string().into());
+                            }
+                            
+                            // Load autoscroll setting from profile
+                            *autoscroll_clone.borrow_mut() = profile.remap.autoscroll;
+                            win.set_autoscroll_enabled(profile.remap.autoscroll);
 
                             // Start/stop remapper to match profile
                             if profile.remap.enabled {
-                                let autoscroll = *autoscroll_clone.borrow();
-                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll);
+                                let autoscroll = profile.remap.autoscroll;
+                                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll, &macro_mgr_clone);
                             } else {
                                 stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                             }
@@ -328,18 +548,23 @@ fn setup_callbacks(
     let device_clone = device.clone();
     let remapper_clone = remapper.clone();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
     let dpi_poller_clone = dpi_poller.clone();
     let autoscroll_clone = autoscroll_enabled.clone();
     let overlay_clone = autoscroll_overlay.clone();
+    let macro_mgr_clone = macro_manager.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_remap_set_enabled(move |enabled| {
         if let Some(win) = window_weak.upgrade() {
             if enabled {
                 let autoscroll = *autoscroll_clone.borrow();
-                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll);
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, autoscroll, &macro_mgr_clone);
             } else {
                 stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                 win.set_status_message("Remapping disabled".into());
             }
+            // Auto-save state to Default profile
+            auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
         }
     });
 
@@ -349,8 +574,11 @@ fn setup_callbacks(
     let remapper_clone = remapper.clone();
     let device_clone = device.clone();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
     let dpi_poller_clone = dpi_poller.clone();
     let overlay_clone = autoscroll_overlay.clone();
+    let macro_mgr_clone = macro_manager.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_autoscroll_set_enabled(move |enabled| {
         info!("Autoscroll set to: {}", enabled);
         *autoscroll_clone.borrow_mut() = enabled;
@@ -362,8 +590,13 @@ fn setup_callbacks(
                 stop_remapper(&device_clone, &remapper_clone, &dpi_poller_clone, &overlay_clone);
                 // Give time for devices to be properly ungrabbed
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, enabled);
+                start_remapper(&win, &device_clone, &remapper_clone, &remap_mappings_clone, &dpi_poller_clone, &overlay_clone, enabled, &macro_mgr_clone);
             }
+        }
+        
+        // Auto-save state to Default profile
+        if let Some(win) = window_weak.upgrade() {
+            auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
         }
     });
 
@@ -424,6 +657,8 @@ fn setup_callbacks(
     // Add mapping
     let window_weak = window.as_weak();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_remap_add_mapping(move |source, target, ctrl, alt, shift, meta| {
         if let Some(win) = window_weak.upgrade() {
             let s = source as u16;
@@ -470,29 +705,60 @@ fn setup_callbacks(
                 false,
                 false,
             );
+            
+            // Auto-save to Default profile
+            auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
+        }
+    });
+    
+    // Add macro mapping (special handling for target codes 1000+)
+    let window_weak = window.as_weak();
+    let remap_mappings_clone = remap_mappings.clone();
+    window.on_remap_add_macro_mapping(move |source, macro_id| {
+        if let Some(win) = window_weak.upgrade() {
+            let s = source as u16;
+            // Store macro ID as target code (1000 + macro_id)
+            let target_code = (1000 + macro_id) as u16;
+            remap_mappings_clone.borrow_mut().insert(
+                s,
+                remap::MappingTarget {
+                    base: target_code,
+                    mods: remap::Modifiers::default(),
+                },
+            );
+            update_remap_summary(&win, &remap_mappings_clone.borrow());
+            win.set_status_message(format!("Mapped button {} -> Macro {}", s, macro_id).into());
         }
     });
 
     // Clear mappings
     let window_weak = window.as_weak();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_remap_clear(move || {
         if let Some(win) = window_weak.upgrade() {
             remap_mappings_clone.borrow_mut().clear();
             update_remap_summary(&win, &remap_mappings_clone.borrow());
             win.set_status_message("Mappings cleared".into());
+            // Auto-save to Default profile
+            auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
         }
     });
 
     // Remove a single mapping by source code
     let window_weak = window.as_weak();
     let remap_mappings_clone = remap_mappings.clone();
+    let remap_mappings_save = remap_mappings.clone();
+    let macro_mgr_save = macro_manager.clone();
     window.on_remap_remove_mapping(move |source| {
         if let Some(win) = window_weak.upgrade() {
             let s = source as u16;
             if remap_mappings_clone.borrow_mut().remove(&s).is_some() {
                 update_remap_summary(&win, &remap_mappings_clone.borrow());
                 win.set_status_message(format!("Removed mapping for button (code {})", s).into());
+                // Auto-save to Default profile
+                auto_save_default_profile(&win, &remap_mappings_save, &macro_mgr_save);
             } else {
                 win.set_status_message(format!("No mapping found for code {}", s).into());
             }
@@ -500,7 +766,7 @@ fn setup_callbacks(
     });
     
     // =====================
-    // Macro Callbacks (stubs for now)
+    // Macro Callbacks
     // =====================
     
     let window_weak = window.as_weak();
@@ -510,28 +776,53 @@ fn setup_callbacks(
             win.set_current_macro_name("".into());
             win.set_macro_actions_text("No actions".into());
             win.set_selected_macro_id(0);
-            win.set_status_message("Creating new macro...".into());
+            win.set_status_message("Creating new macro - enter name and start recording".into());
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_edit_macro(move |macro_id| {
         if let Some(win) = window_weak.upgrade() {
             info!("Edit macro {} requested", macro_id);
-            win.set_status_message(format!("Editing macro {}", macro_id).into());
+            let mgr = macro_mgr.borrow();
+            if let Some(m) = mgr.get_macro(macro_id as u32) {
+                win.set_selected_macro_id(macro_id);
+                win.set_current_macro_name(m.name.clone().into());
+                // Populate actions list for editing
+                let actions: Vec<slint::SharedString> = m.actions.iter()
+                    .map(|a| a.to_display_string().into())
+                    .collect();
+                win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
+                win.set_selected_action_index(-1);
+                win.set_status_message(format!("Editing macro '{}'", m.name).into());
+            } else {
+                win.set_status_message(format!("Macro {} not found", macro_id).into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_delete_macro(move |macro_id| {
         if let Some(win) = window_weak.upgrade() {
             info!("Delete macro {} requested", macro_id);
-            win.set_status_message(format!("Deleted macro {}", macro_id).into());
-            win.set_macro_list_text("No macros defined".into());
+            let mut mgr = macro_mgr.borrow_mut();
+            if mgr.delete_macro(macro_id as u32) {
+                win.set_macro_list_text(mgr.get_macros_list_text().into());
+                win.set_available_macros(mgr.get_available_macros_string().into());
+                win.set_current_macro_name("".into());
+                win.set_macro_actions_text("No actions".into());
+                win.set_selected_macro_id(0);
+                win.set_status_message(format!("Deleted macro {}", macro_id).into());
+            } else {
+                win.set_status_message(format!("Macro {} not found", macro_id).into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_save_macro(move |name, repeat| {
         if let Some(win) = window_weak.upgrade() {
             info!("Save macro '{}' with repeat={}", name, repeat);
@@ -539,61 +830,398 @@ fn setup_callbacks(
                 win.set_status_message("Please enter a macro name".into());
                 return;
             }
-            win.set_status_message(format!("Saved macro '{}'", name).into());
-            // TODO: Actually save to profile
+            
+            let mut mgr = macro_mgr.borrow_mut();
+            let selected_id = win.get_selected_macro_id();
+            
+            if selected_id > 0 {
+                // Update existing macro
+                mgr.update_macro(selected_id as u32, &name, repeat as u32);
+                win.set_status_message(format!("Updated macro '{}'", name).into());
+            } else {
+                // Create new macro (recording should have been done already)
+                let id = mgr.get_next_id();
+                let m = profile::Macro::new(id, name.to_string());
+                mgr.save_macro(m);
+                win.set_selected_macro_id(id as i32);
+                win.set_status_message(format!("Created macro (id={})", id).into());
+            }
+            
+            win.set_macro_list_text(mgr.get_macros_list_text().into());
+            win.set_available_macros(mgr.get_available_macros_string().into());
         }
     });
     
+    // Persistent key capture listener (stored in Rc for sharing)
+    let key_listener: Rc<RefCell<Option<remap::KeyCaptureListener>>> = Rc::new(RefCell::new(None));
+    
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
+    let key_listener_ref = key_listener.clone();
     window.on_start_macro_recording(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Macro recording started");
-            win.set_macro_recording(true);
-            win.set_status_message("Recording macro... press keys to record".into());
-            win.set_macro_actions_text("Recording...".into());
+            let mut mgr = macro_mgr.borrow_mut();
+            let name = win.get_current_macro_name().to_string();
+            let macro_name = if name.is_empty() { "Untitled" } else { &name };
+            
+            // Start the key capture listener
+            match remap::KeyCaptureListener::start() {
+                Ok(listener) => {
+                    *key_listener_ref.borrow_mut() = Some(listener);
+                    mgr.start_recording(macro_name);
+                    win.set_macro_recording(true);
+                    win.set_selected_action_index(-1);  // Clear action selection
+                    // Clear the actions list
+                    let empty_list: Vec<slint::SharedString> = Vec::new();
+                    win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(empty_list)));
+                    win.set_status_message("🎤 Recording! Type keys anywhere - they'll be captured automatically".into());
+                    info!("Macro recording started for '{}'", macro_name);
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("Permission") || err_str.contains("permission") {
+                        win.set_status_message("❌ Permission denied - see instructions".into());
+                        win.set_macro_actions_text("⚠️ Permission required to capture keys!\n\n1. Add user to input group:\n   sudo usermod -aG input $USER\n   (then log out and back in)\n\nOR run app with:\n   sudo -E ./razerlinux".into());
+                    } else {
+                        win.set_status_message(format!("❌ Failed to start: {}", e).into());
+                    }
+                }
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
+    let key_listener_ref = key_listener.clone();
     window.on_stop_macro_recording(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Macro recording stopped");
-            win.set_macro_recording(false);
-            win.set_status_message("Recording stopped".into());
+            // Stop the key listener
+            if let Some(listener) = key_listener_ref.borrow_mut().take() {
+                listener.stop();
+            }
+            
+            let mut mgr = macro_mgr.borrow_mut();
+            
+            if let Some(recorded_macro) = mgr.stop_recording() {
+                win.set_macro_recording(false);
+                win.set_selected_macro_id(recorded_macro.id as i32);
+                win.set_current_macro_name(recorded_macro.name.clone().into());
+                // Update the actions list
+                let actions: Vec<slint::SharedString> = recorded_macro.actions.iter()
+                    .map(|a| a.to_display_string().into())
+                    .collect();
+                win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
+                win.set_macro_list_text(mgr.get_macros_list_text().into());
+                win.set_available_macros(mgr.get_available_macros_string().into());
+                win.set_status_message(format!("✅ Recorded {} actions", recorded_macro.actions.len()).into());
+            } else {
+                win.set_macro_recording(false);
+                win.set_status_message("No recording in progress".into());
+            }
         }
     });
     
+    // Polling timer to check for captured keys during recording
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
+    let key_listener_poll = key_listener.clone();
+    let poll_timer = slint::Timer::default();
+    poll_timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(16), move || {
+        if let Some(win) = window_weak.upgrade() {
+            if !win.get_macro_recording() {
+                return;
+            }
+            
+            let listener_opt = key_listener_poll.borrow();
+            if let Some(listener) = listener_opt.as_ref() {
+                // Drain all available keys
+                let mut captured_any = false;
+                while let Some(key) = listener.try_recv() {
+                    captured_any = true;
+                    let mut mgr = macro_mgr.borrow_mut();
+                    if key.is_press {
+                        mgr.record_key_press(key.code);
+                    } else {
+                        mgr.record_key_release(key.code);
+                    }
+                }
+                
+                if captured_any {
+                    let mgr = macro_mgr.borrow();
+                    // Update the actions list model
+                    let actions: Vec<slint::SharedString> = mgr.get_recording_actions_list()
+                        .into_iter()
+                        .map(|s| s.into())
+                        .collect();
+                    win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
+                }
+            }
+        }
+    });
+    // Keep timer alive
+    std::mem::forget(poll_timer);
+    
+    let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_add_macro_keypress(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Add keypress to macro");
-            win.set_status_message("Click a key to add to macro...".into());
-            // TODO: Implement key capture
+            let is_recording = macro_mgr.borrow().is_recording();
+            if !is_recording {
+                win.set_status_message("⚠️ Click 'Record' first to start capturing keys".into());
+            } else {
+                win.set_status_message("🎯 Just type on your keyboard - keys are captured automatically!".into());
+            }
+        }
+    });
+    
+    // Handler for captured keys from background thread
+    let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
+    window.on_record_captured_key(move |key_code, include_release| {
+        if let Some(win) = window_weak.upgrade() {
+            let mut mgr = macro_mgr.borrow_mut();
+            if mgr.is_recording() {
+                mgr.record_key_press(key_code as u16);
+                if include_release {
+                    mgr.record_key_release(key_code as u16);
+                }
+                win.set_macro_actions_text(mgr.get_recording_display_text().into());
+                win.set_status_message(format!("✓ Recorded key {}", key_name(key_code as u16).unwrap_or_else(|| format!("0x{:X}", key_code))).into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_add_macro_delay(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Add delay to macro");
-            // Add a default 100ms delay
-            let current = win.get_macro_actions_text().to_string();
-            let new_text = if current == "No actions" || current == "Recording..." {
-                "⏱ 100ms".to_string()
+            let mut mgr = macro_mgr.borrow_mut();
+            if mgr.is_recording() {
+                mgr.add_delay(100);
+                // Update the actions list model
+                let actions: Vec<slint::SharedString> = mgr.get_recording_actions_list()
+                    .into_iter()
+                    .map(|s| s.into())
+                    .collect();
+                win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
+                win.set_status_message("Added 100ms delay".into());
             } else {
-                format!("{}\n⏱ 100ms", current)
+                win.set_status_message("Start recording first".into());
+            }
+        }
+    });
+    
+    // Handler to remove an action from recording or saved macro
+    let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
+    window.on_remove_macro_action(move |index| {
+        if let Some(win) = window_weak.upgrade() {
+            let mut mgr = macro_mgr.borrow_mut();
+            let is_recording = mgr.is_recording();
+            let selected_id = win.get_selected_macro_id();
+            
+            let removed = if is_recording {
+                // Remove from current recording
+                mgr.remove_recording_action(index as usize)
+            } else if selected_id > 0 {
+                // Remove from saved macro
+                mgr.remove_macro_action(selected_id as u32, index as usize)
+            } else {
+                false
             };
-            win.set_macro_actions_text(new_text.into());
-            win.set_status_message("Added 100ms delay".into());
+            
+            if removed {
+                // Update the actions list model
+                let actions: Vec<slint::SharedString> = if is_recording {
+                    mgr.get_recording_actions_list()
+                } else {
+                    mgr.get_macro_actions_list(selected_id as u32)
+                }.into_iter().map(|s| s.into()).collect();
+                
+                win.set_macro_actions_list(slint::ModelRc::new(slint::VecModel::from(actions)));
+                win.set_status_message("Removed action".into());
+            }
         }
     });
     
     let window_weak = window.as_weak();
+    let macro_mgr = macro_manager.clone();
     window.on_test_macro(move || {
         if let Some(win) = window_weak.upgrade() {
-            info!("Test macro requested");
-            win.set_status_message("Testing macro... (not implemented yet)".into());
-            // TODO: Actually execute the macro via uinput
+            let selected_id = win.get_selected_macro_id();
+            if selected_id <= 0 {
+                win.set_status_message("No macro selected".into());
+                return;
+            }
+            
+            let mgr = macro_mgr.borrow();
+            if let Some(m) = mgr.get_macro(selected_id as u32) {
+                let macro_clone = m.clone();
+                drop(mgr); // Release borrow before spawning thread
+                
+                info!("Testing macro '{}' with {} actions", macro_clone.name, macro_clone.actions.len());
+                win.set_status_message(format!("Testing macro '{}'...", macro_clone.name).into());
+                
+                // Execute in background thread
+                std::thread::spawn(move || {
+                    if let Err(e) = macro_engine::execute_macro(&macro_clone) {
+                        error!("Macro execution failed: {}", e);
+                    }
+                });
+            } else {
+                win.set_status_message("Macro not found".into());
+            }
+        }
+    });
+    
+    // ===== SETTINGS HANDLERS =====
+    
+    // Load and display current settings
+    let window_weak = window.as_weak();
+    if let Some(win) = window_weak.upgrade() {
+        match AppSettings::load() {
+            Ok(settings) => {
+                win.set_autostart_enabled(settings.autostart || settings::is_autostart_enabled());
+                win.set_default_profile(settings.default_profile.clone().into());
+                win.set_minimize_to_tray(settings.minimize_to_tray);
+                
+                // Systemd user service status
+                win.set_systemd_available(settings::is_systemd_available());
+                win.set_systemd_enabled(settings::is_systemd_enabled());
+                
+                // Load default profile on startup if specified
+                if !settings.default_profile.is_empty() {
+                    info!("Loading default profile: {}", settings.default_profile);
+                    // We'll trigger load after all callbacks are set up
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load settings: {}", e);
+            }
+        }
+    }
+    
+    // Set autostart callback
+    let window_weak = window.as_weak();
+    window.on_set_autostart(move |enabled| {
+        info!("Setting autostart: {}", enabled);
+        if let Some(win) = window_weak.upgrade() {
+            match AppSettings::load() {
+                Ok(mut settings) => {
+                    if let Err(e) = settings.set_autostart(enabled) {
+                        error!("Failed to set autostart: {}", e);
+                        win.set_status_message(format!("Failed to set autostart: {}", e).into());
+                    } else {
+                        win.set_status_message(if enabled {
+                            "Autostart enabled".into()
+                        } else {
+                            "Autostart disabled".into()
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    win.set_status_message(format!("Settings error: {}", e).into());
+                }
+            }
+        }
+    });
+    
+    // Set systemd autostart callback
+    let window_weak = window.as_weak();
+    window.on_set_systemd_autostart(move |enabled| {
+        info!("Setting systemd autostart: {}", enabled);
+        if let Some(win) = window_weak.upgrade() {
+            let result = if enabled {
+                settings::enable_systemd_service()
+            } else {
+                settings::disable_systemd_service()
+            };
+            
+            match result {
+                Ok(()) => {
+                    win.set_status_message(if enabled {
+                        "Systemd autostart enabled".into()
+                    } else {
+                        "Systemd autostart disabled".into()
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to set systemd autostart: {}", e);
+                    win.set_status_message(format!("Failed: {}", e).into());
+                    // Revert the checkbox
+                    win.set_systemd_enabled(!enabled);
+                }
+            }
+        }
+    });
+    
+    // Set default profile callback
+    let window_weak = window.as_weak();
+    window.on_set_default_profile(move |profile_name| {
+        let name = profile_name.to_string();
+        info!("Setting default profile: '{}'", name);
+        if let Some(win) = window_weak.upgrade() {
+            match AppSettings::load() {
+                Ok(mut settings) => {
+                    if let Err(e) = settings.set_default_profile(&name) {
+                        error!("Failed to set default profile: {}", e);
+                        win.set_status_message(format!("Failed to save setting: {}", e).into());
+                    } else {
+                        if name.is_empty() {
+                            win.set_status_message("Default profile cleared".into());
+                        } else {
+                            win.set_status_message(format!("Default profile set to '{}'", name).into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    win.set_status_message(format!("Settings error: {}", e).into());
+                }
+            }
+        }
+    });
+    
+    // Refresh profile list callback
+    let window_weak = window.as_weak();
+    window.on_refresh_profile_list(move || {
+        if let Some(win) = window_weak.upgrade() {
+            match settings::get_profile_list() {
+                Ok(profiles) => {
+                    let list: Vec<slint::SharedString> = profiles.into_iter().map(|s| s.into()).collect();
+                    win.set_profile_list(slint::ModelRc::new(slint::VecModel::from(list)));
+                }
+                Err(e) => {
+                    warn!("Failed to get profile list: {}", e);
+                }
+            }
+        }
+    });
+    
+    // Set minimize to tray callback
+    let window_weak = window.as_weak();
+    window.on_set_minimize_to_tray(move |enabled| {
+        info!("Setting minimize to tray: {}", enabled);
+        if let Some(win) = window_weak.upgrade() {
+            match AppSettings::load() {
+                Ok(mut settings) => {
+                    if let Err(e) = settings.set_minimize_to_tray(enabled) {
+                        error!("Failed to set minimize to tray: {}", e);
+                        win.set_status_message(format!("Failed to save setting: {}", e).into());
+                    } else {
+                        win.set_status_message(if enabled {
+                            "Will minimize to tray on close".into()
+                        } else {
+                            "Will quit on close".into()
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load settings: {}", e);
+                    win.set_status_message(format!("Settings error: {}", e).into());
+                }
+            }
         }
     });
 }
@@ -606,6 +1234,7 @@ fn start_remapper(
     dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
     autoscroll_overlay: &Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
     autoscroll_enabled: bool,
+    macro_manager: &Rc<RefCell<macro_engine::MacroManager>>,
 ) {
     if remapper.borrow().is_some() {
         win.set_status_message("Remapping already enabled".into());
@@ -668,7 +1297,18 @@ fn start_remapper(
         None
     };
 
-    match remap::Remapper::start(config, overlay_sender) {
+    // Clone macros for the remapper thread
+    // Note: Macros are cloned at remapper start time. If macros are edited while
+    // remapper is running, the remapper won't see the changes until restart.
+    let macros_for_remapper: std::collections::HashMap<u32, profile::Macro> = {
+        let mgr = macro_manager.borrow();
+        mgr.export_for_profile()
+            .into_iter()
+            .map(|m| (m.id, m))
+            .collect()
+    };
+
+    match remap::Remapper::start(config, overlay_sender, macros_for_remapper) {
         Ok(r) => {
             *remapper.borrow_mut() = Some(r);
             win.set_status_message("Remapping enabled (virtual device active)".into());
@@ -831,6 +1471,8 @@ fn format_mapping_target(t: &remap::MappingTarget) -> String {
 fn key_name(code: u16) -> Option<String> {
     // Common, user-friendly labels for typical keyboard codes
     match code {
+        // Macro IDs are 1000+
+        1001..=1999 => Some(format!("Macro {}", code - 1000)),
         2..=11 => Some(format!("{}", code_to_digit(code)?)),
         59 => Some("F1".into()),
         60 => Some("F2".into()),
@@ -929,6 +1571,89 @@ fn connect_device_inner(window: &MainWindow, device: &Rc<RefCell<Option<device::
         }
         Err(e) => {
             window.set_status_message(format!("Scan error: {}", e).into());
+        }
+    }
+}
+
+/// Load a profile on startup (simplified version without starting remapper)
+fn load_profile_on_startup(
+    window: &MainWindow,
+    device: &Rc<RefCell<Option<device::RazerDevice>>>,
+    remap_mappings: &Rc<RefCell<BTreeMap<u16, remap::MappingTarget>>>,
+    macro_manager: &Rc<RefCell<macro_engine::MacroManager>>,
+    remapper: &Rc<RefCell<Option<remap::Remapper>>>,
+    dpi_poller: &Rc<RefCell<Option<hidpoll::DpiButtonPoller>>>,
+    autoscroll_enabled: &Rc<RefCell<bool>>,
+    autoscroll_overlay: &Rc<RefCell<Option<overlay::AutoscrollOverlay>>>,
+    profile_name: &str,
+) {
+    match ProfileManager::new() {
+        Ok(manager) => {
+            match manager.load_profile(profile_name) {
+                Ok(profile) => {
+                    // Update UI with profile settings
+                    window.set_current_dpi_x(profile.dpi.x as i32);
+                    window.set_current_dpi_y(profile.dpi.y as i32);
+
+                    // Apply DPI to device if connected
+                    if let Some(ref mut dev) = *device.borrow_mut() {
+                        if let Err(e) = dev.set_dpi(profile.dpi.x, profile.dpi.y) {
+                            error!("Failed to apply profile DPI on startup: {}", e);
+                        }
+                    }
+
+                    // Load remap mappings into state
+                    {
+                        let mut map = remap_mappings.borrow_mut();
+                        map.clear();
+                        for m in &profile.remap.mappings {
+                            map.insert(
+                                m.source,
+                                remap::MappingTarget {
+                                    base: m.target,
+                                    mods: remap::Modifiers {
+                                        ctrl: m.ctrl,
+                                        alt: m.alt,
+                                        shift: m.shift,
+                                        meta: m.meta,
+                                    },
+                                },
+                            );
+                        }
+                    }
+                    window.set_remap_enabled(profile.remap.enabled);
+                    update_remap_summary(window, &remap_mappings.borrow());
+                    
+                    // Load autoscroll setting from profile
+                    *autoscroll_enabled.borrow_mut() = profile.remap.autoscroll;
+                    window.set_autoscroll_enabled(profile.remap.autoscroll);
+                    
+                    // Load macros from profile
+                    {
+                        let mut mgr = macro_manager.borrow_mut();
+                        mgr.load_from_profile(profile.macros.clone());
+                        window.set_macro_list_text(mgr.get_macros_list_text().into());
+                        window.set_available_macros(mgr.get_available_macros_string().into());
+                    }
+
+                    // Start the remapper if profile has it enabled
+                    if profile.remap.enabled {
+                        let autoscroll = profile.remap.autoscroll;  // Use profile setting
+                        info!("Starting remapper from startup profile (autoscroll: {})", autoscroll);
+                        start_remapper(window, device, remapper, remap_mappings, dpi_poller, autoscroll_overlay, autoscroll, macro_manager);
+                    }
+
+                    window.set_status_message(format!("Profile '{}' loaded!", profile_name).into());
+                    info!("Loaded default profile '{}' on startup", profile_name);
+                }
+                Err(e) => {
+                    warn!("Failed to load default profile '{}': {}", profile_name, e);
+                    window.set_status_message(format!("Profile '{}' not found", profile_name).into());
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to create profile manager: {}", e);
         }
     }
 }

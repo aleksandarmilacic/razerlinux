@@ -27,6 +27,8 @@ pub struct RemapConfig {
 pub struct RemapConfigExt {
     pub config: RemapConfig,
     pub overlay_sender: Option<Sender<OverlayCommand>>,
+    /// Macros available for execution (cloned from MacroManager at start)
+    pub macros: std::collections::HashMap<u32, crate::profile::Macro>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,13 +142,18 @@ pub struct Remapper {
 }
 
 impl Remapper {
-    pub fn start(config: RemapConfig, overlay_sender: Option<Sender<OverlayCommand>>) -> Result<Self> {
+    pub fn start(
+        config: RemapConfig, 
+        overlay_sender: Option<Sender<OverlayCommand>>,
+        macros: std::collections::HashMap<u32, crate::profile::Macro>,
+    ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
 
         let ext_config = RemapConfigExt {
             config,
             overlay_sender,
+            macros,
         };
 
         let join = thread::spawn(move || {
@@ -181,6 +188,7 @@ impl Drop for Remapper {
 fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Result<()> {
     let config = ext_config.config;
     let overlay_sender = ext_config.overlay_sender;
+    let macros = ext_config.macros;
     
     // Find ALL Razer keyboard interfaces - the Naga Trinity sends side button keys
     // through multiple interfaces (event9 AND event11), so we need to grab them all
@@ -434,7 +442,7 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                 info!("KEY event: code={}, value={}", key.code(), ev.value());
                             }
                             InputEventKind::RelAxis(axis) => {
-                                info!("REL event: axis={:?}, value={}", axis, ev.value());
+                            info!("REL event: axis={:?}, value={}", axis, ev.value());
                             }
                             InputEventKind::Synchronization(_) => {
                                 // Don't log sync events (too noisy)
@@ -443,7 +451,7 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                 info!("OTHER event: type={:?}, code={}, value={}", ev.event_type(), ev.code(), ev.value());
                             }
                         }
-                        if let Some(mapped_events) = remap_events(&config.mappings, ev) {
+                        if let Some(mapped_events) = remap_events(&config.mappings, ev, &macros) {
                             if let Err(e) = vdev.emit(&mapped_events) {
                                 warn!("uinput emit failed: {e}");
                             }
@@ -472,10 +480,13 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
 fn remap_events(
     mappings: &BTreeMap<u16, MappingTarget>,
     ev: InputEvent,
+    macros: &std::collections::HashMap<u32, crate::profile::Macro>,
 ) -> Option<Vec<InputEvent>> {
     // Special codes for scroll wheel emulation
     const SCROLL_UP_CODE: u16 = 280;
     const SCROLL_DOWN_CODE: u16 = 281;
+    // Macro target codes are 1000+ (1001 = macro id 1, etc.)
+    const MACRO_CODE_BASE: u16 = 1000;
     // REL_WHEEL axis code
     const REL_WHEEL: u16 = 8;
     
@@ -496,6 +507,28 @@ fn remap_events(
                         out.push(InputEvent::new(EventType::RELATIVE, REL_WHEEL, scroll_value));
                     }
                     return Some(out);
+                }
+                
+                // Handle macro target codes
+                if target.base > MACRO_CODE_BASE && target.base < 2000 {
+                    let macro_id = (target.base - MACRO_CODE_BASE) as u32;
+                    // Only trigger on key press (value=1), not release
+                    if value == 1 {
+                        info!("MACRO: triggering macro id={}", macro_id);
+                        if let Some(macro_data) = macros.get(&macro_id) {
+                            // Execute macro in a background thread to avoid blocking input
+                            let macro_clone = macro_data.clone();
+                            std::thread::spawn(move || {
+                                if let Err(e) = crate::macro_engine::execute_macro(&macro_clone) {
+                                    warn!("Macro execution failed: {}", e);
+                                }
+                            });
+                        } else {
+                            warn!("Macro id={} not found in remapper's macro cache", macro_id);
+                        }
+                    }
+                    // Don't emit any key events for macros
+                    return Some(vec![]);
                 }
 
                 match value {
@@ -646,6 +679,232 @@ pub fn capture_next_key_code(timeout: Duration, preferred_device: Option<&str>) 
     }
 
     anyhow::bail!("Timed out waiting for button press.");
+}
+
+// ========== Persistent Key Capture for Macro Recording ==========
+
+use std::sync::mpsc;
+
+/// A captured keyboard event for macro recording
+#[derive(Debug, Clone)]
+pub struct CapturedKey {
+    pub code: u16,
+    pub is_press: bool,
+}
+
+/// Persistent key listener that captures keyboard events during macro recording.
+/// This is much more reliable than per-key capture because:
+/// 1. Devices are opened once and kept open
+/// 2. All key presses AND releases are captured automatically
+/// 3. No re-scanning between each key
+pub struct KeyCaptureListener {
+    stop_flag: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<CapturedKey>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl KeyCaptureListener {
+    /// Start a persistent key capture listener.
+    /// Returns immediately with a listener that receives key events.
+    pub fn start() -> Result<Self> {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        
+        let (sender, receiver) = mpsc::channel::<CapturedKey>();
+        
+        // Try to open keyboard devices before spawning thread
+        let mut paths: Vec<PathBuf> = Vec::new();
+        
+        info!("KeyCaptureListener: Scanning for keyboard devices...");
+        
+        for (path, dev) in evdev::enumerate() {
+            let name = dev.name().unwrap_or_default().to_string();
+            
+            // Check if this is a keyboard (has regular keyboard keys)
+            let has_keyboard = dev.supported_keys()
+                .map(|k| {
+                    k.contains(Key::KEY_A) || k.contains(Key::KEY_1) || k.contains(Key::KEY_SPACE)
+                })
+                .unwrap_or(false);
+            
+            if has_keyboard {
+                info!("  Found keyboard: {:?} ({})", path, name);
+                paths.push(path);
+            }
+        }
+        
+        if paths.is_empty() {
+            anyhow::bail!("No keyboard devices found");
+        }
+        
+        // Open devices
+        let mut devices: Vec<(Device, String)> = Vec::new();
+        for path in &paths {
+            match Device::open(path) {
+                Ok(dev) => {
+                    let name = dev.name().unwrap_or("?").to_string();
+                    if let Err(e) = set_nonblocking(&dev) {
+                        warn!("Failed to set non-blocking on {:?}: {}", path, e);
+                        continue;
+                    }
+                    devices.push((dev, name));
+                }
+                Err(e) => {
+                    warn!("Failed to open keyboard {:?}: {}", path, e);
+                }
+            }
+        }
+        
+        if devices.is_empty() {
+            anyhow::bail!("Permission denied: Add user to 'input' group with: sudo usermod -aG input $USER (then log out/in)");
+        }
+        
+        info!("KeyCaptureListener: Started listening on {} keyboard(s)", devices.len());
+        
+        let thread = std::thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                for (dev, _name) in &mut devices {
+                    match dev.fetch_events() {
+                        Ok(events) => {
+                            for ev in events {
+                                if let InputEventKind::Key(key) = ev.kind() {
+                                    // value=1 is press, value=0 is release
+                                    if ev.value() == 1 || ev.value() == 0 {
+                                        let captured = CapturedKey {
+                                            code: key.code(),
+                                            is_press: ev.value() == 1,
+                                        };
+                                        if sender.send(captured).is_err() {
+                                            // Receiver dropped, stop listening
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => {}
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        
+        Ok(Self {
+            stop_flag,
+            receiver,
+            _thread: thread,
+        })
+    }
+    
+    /// Try to receive a captured key (non-blocking)
+    pub fn try_recv(&self) -> Option<CapturedKey> {
+        self.receiver.try_recv().ok()
+    }
+    
+    /// Wait for the next key with timeout
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<CapturedKey> {
+        self.receiver.recv_timeout(timeout).ok()
+    }
+    
+    /// Stop the listener
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for KeyCaptureListener {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Capture a single keypress for macro recording
+/// Returns (key_code, is_press) - captures both press and release events
+pub fn capture_key_for_macro(timeout: Duration) -> Result<(u16, bool)> {
+    // Find keyboard devices (not just Razer - any keyboard will do for macro recording)
+    let mut paths: Vec<PathBuf> = Vec::new();
+
+    info!("Scanning for keyboard devices for macro key capture...");
+
+    for (path, dev) in evdev::enumerate() {
+        let name = dev.name().unwrap_or_default().to_string();
+        
+        // Check if this is a keyboard (has regular keyboard keys)
+        let has_keyboard = dev.supported_keys()
+            .map(|k| {
+                k.contains(Key::KEY_A) || k.contains(Key::KEY_1) || k.contains(Key::KEY_SPACE)
+            })
+            .unwrap_or(false);
+        
+        if has_keyboard {
+            info!("  Found keyboard: {:?} ({})", path, name);
+            paths.push(path);
+        }
+    }
+
+    if paths.is_empty() {
+        anyhow::bail!("No keyboard devices found for macro recording");
+    }
+
+    info!("Macro capture: listening on {} keyboard(s)", paths.len());
+
+    // Open devices
+    let mut devices: Vec<(Device, String)> = Vec::new();
+    for path in &paths {
+        match Device::open(path) {
+            Ok(dev) => {
+                let name = dev.name().unwrap_or("?").to_string();
+                if let Err(e) = set_nonblocking(&dev) {
+                    warn!("Failed to set non-blocking on {:?}: {}", path, e);
+                    continue;
+                }
+                devices.push((dev, name));
+            }
+            Err(e) => {
+                warn!("Failed to open keyboard {:?}: {}", path, e);
+            }
+        }
+    }
+
+    if devices.is_empty() {
+        anyhow::bail!("Permission denied: Add user to 'input' group with: sudo usermod -aG input $USER (then log out/in) OR run with: sudo -E razerlinux");
+    }
+
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let mut any_events = false;
+
+        for (dev, name) in &mut devices {
+            match dev.fetch_events() {
+                Ok(events) => {
+                    for ev in events {
+                        any_events = true;
+                        if let InputEventKind::Key(key) = ev.kind() {
+                            // Capture key press (value=1) or release (value=0)
+                            if ev.value() == 1 || ev.value() == 0 {
+                                let is_press = ev.value() == 1;
+                                info!("Macro: Captured key {} {} from {}", 
+                                      key.code(), 
+                                      if is_press { "PRESS" } else { "RELEASE" },
+                                      name);
+                                return Ok((key.code(), is_press));
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => warn!("Error reading from {}: {}", name, e),
+            }
+        }
+
+        if !any_events {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    anyhow::bail!("Timed out waiting for key press");
 }
 
 /// Select ALL Razer keyboard interfaces for grabbing.

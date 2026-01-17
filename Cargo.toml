@@ -41,5 +41,29 @@ slint = "1"
 # X11 for overlay window (autoscroll indicator)
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 
+# System tray icon
+tray-icon = "0.19"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ksni = "0.2"
+
 [build-dependencies]
 slint-build = "1"
+
+# Release profile - optimized for size and performance
+[profile.release]
+strip = true           # Strip debug symbols
+lto = true             # Link-time optimization
+codegen-units = 1      # Better optimization (slower compile)
+panic = "abort"        # Smaller binary, no unwinding
+opt-level = "s"        # Optimize for size (use "3" for speed)
+
+# Dev profile - faster iteration
+[profile.dev]
+opt-level = 1          # Some optimization for usable debug builds
+debug = true           # Keep debug info
+
+# Fast release for testing (between dev and release)
+[profile.release-fast]
+inherits = "release"
+lto = false            # Skip LTO for faster compile
+codegen-units = 16     # Parallel compilation

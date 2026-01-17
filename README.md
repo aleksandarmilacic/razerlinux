@@ -115,9 +115,33 @@ cd razerlinux
 cargo build --release
 ```
 
-### udev Rules (Required)
+### Quick Install (Recommended)
 
-To access the device without root, install the udev rules:
+The easiest way to install RazerLinux system-wide:
+
+```bash
+sudo ./install.sh
+```
+
+This will:
+- Build the release version
+- Install to `/opt/razerlinux/`
+- Set up udev rules for non-root device access
+- Create a desktop entry (appears in your app menu)
+- Set up polkit for privilege escalation when needed
+
+After installation:
+1. **Unplug and replug** your Razer mouse (for udev rules)
+2. Run `razerlinux` from terminal or find "RazerLinux" in your app menu
+
+To uninstall:
+```bash
+sudo /opt/razerlinux/uninstall.sh
+```
+
+### Manual udev Rules (Alternative)
+
+If you prefer manual setup, install the udev rules:
 
 ```bash
 sudo cp config/99-razermouse.rules /etc/udev/rules.d/
@@ -175,6 +199,12 @@ Enable the "Windows Autoscroll" checkbox in the Remapping panel to get Windows-l
 - Save current settings to named profiles
 - Load profiles to quickly switch configurations
 - Profiles stored in `~/.config/razerlinux/profiles/`
+
+#### Startup & System Tray
+- **Autostart**: Enable in Settings → "Start RazerLinux on system startup"
+- **Default Profile**: Set a profile to load automatically on startup
+- **System Tray Icon**: Green indicator shows RazerLinux is running
+- Settings stored in `~/.config/razerlinux/settings.toml`
 
 ## Configuration
 
