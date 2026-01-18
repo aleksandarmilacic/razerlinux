@@ -44,12 +44,19 @@ struct LinuxTray {
 #[cfg(target_os = "linux")]
 impl ksni::Tray for LinuxTray {
     fn title(&self) -> String {
-        "RazerLinux".to_string()
+        // Add (Debug) suffix for debug builds
+        #[cfg(debug_assertions)]
+        { "RazerLinux (Debug)".to_string() }
+        #[cfg(not(debug_assertions))]
+        { "RazerLinux".to_string() }
     }
 
     fn icon_name(&self) -> String {
-        // Use a standard icon that definitely exists
-        "input-mouse".to_string()
+        // Use different icon for debug builds to differentiate from release
+        #[cfg(debug_assertions)]
+        { "applications-development".to_string() }
+        #[cfg(not(debug_assertions))]
+        { "input-mouse".to_string() }
     }
 
     fn id(&self) -> String {

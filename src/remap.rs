@@ -1,6 +1,7 @@
 //! Software button remapping (evdev grab + uinput virtual device)
 
 use crate::overlay::OverlayCommand;
+use crate::scroll_detect_x11::ScrollDetectorX11;
 use anyhow::{Context, Result};
 use evdev::{AttributeSet, Device, EventType, InputEvent, InputEventKind, Key, uinput::VirtualDeviceBuilder};
 use std::collections::BTreeMap;
@@ -13,7 +14,8 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
+use x11rb::connection::Connection;
 
 #[derive(Debug, Clone, Default)]
 pub struct RemapConfig {
@@ -190,6 +192,34 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
     let overlay_sender = ext_config.overlay_sender;
     let macros = ext_config.macros;
     
+    // Initialize X11 scroll detector for Windows-like autoscroll behavior
+    // This detects if the cursor is over a scrollable area (not desktop/dock/menu)
+    let scroll_detector: Option<(x11rb::rust_connection::RustConnection, u32, ScrollDetectorX11)> = 
+        if config.autoscroll_enabled {
+            match x11rb::connect(None) {
+                Ok((conn, screen_num)) => {
+                    let screen = &conn.setup().roots[screen_num];
+                    let root = screen.root;
+                    match ScrollDetectorX11::new(&conn) {
+                        Ok(detector) => {
+                            info!("X11 scroll detector initialized (root window: {})", root);
+                            Some((conn, root, detector))
+                        }
+                        Err(e) => {
+                            warn!("Failed to initialize scroll detector: {} - autoscroll will work everywhere", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to connect to X11: {} - autoscroll will work everywhere", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    
     // Find ALL Razer keyboard interfaces - the Naga Trinity sends side button keys
     // through multiple interfaces (event9 AND event11), so we need to grab them all
     let source_paths = select_all_razer_keyboard_devices(&config.source_device);
@@ -285,19 +315,46 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
     let mut autoscroll_toggle_mode = false;  // true = toggle mode (click to exit), false = hold mode
     let mut autoscroll_moved = false;  // Track if mouse moved during autoscroll
     let mut middle_press_time: Option<Instant> = None;  // Track when middle button was pressed
+    let mut middle_passthrough = false;  // Track if middle press was passed through (non-scrollable area)
     let mut anchor_x: i32 = 0;  // Anchor point X (where middle-click happened)
     let mut anchor_y: i32 = 0;  // Anchor point Y
     let mut cursor_x: i32 = 0;  // Current cursor position X
     let mut cursor_y: i32 = 0;  // Current cursor position Y
     let mut scroll_tick_counter: u32 = 0;  // For throttling scroll events
-    const SCROLL_THRESHOLD: i32 = 15;  // Pixels from anchor before scrolling starts (dead zone)
-    const SCROLL_SPEED_DIVISOR: f32 = 40.0;  // Higher = slower scrolling
-    const SCROLL_TICK_INTERVAL: u32 = 4;  // Emit scroll every N movement events
-    const DIRECTION_UPDATE_INTERVAL: u32 = 15;  // Update overlay direction every N events
-    const SHORT_CLICK_THRESHOLD_MS: u64 = 200;  // Max ms for short click (toggle mode)
+    const SCROLL_DEAD_ZONE: i32 = 15;  // Pixels from anchor before scrolling starts
+    const SCROLL_TICK_INTERVAL: u32 = 3;  // Emit scroll every N movement events
+    const DIRECTION_UPDATE_INTERVAL: u32 = 12;  // Update overlay direction every N events
+    const QUICK_CLICK_THRESHOLD_MS: u64 = 150;  // Max ms for quick click (pass through for links etc)
+    const TOGGLE_MODE_THRESHOLD_MS: u64 = 400;  // Max ms for toggle mode (between quick click and hold)
     const BTN_MIDDLE: u16 = 274;
     const REL_WHEEL: u16 = 8;
     const REL_HWHEEL: u16 = 6;
+    
+    // Speed zones for gradual acceleration (distance -> scroll speed)
+    // Zone 1: 15-50px = speed 1 (slow)
+    // Zone 2: 50-100px = speed 2 (medium-slow) 
+    // Zone 3: 100-150px = speed 3 (medium)
+    // Zone 4: 150-200px = speed 4 (medium-fast)
+    // Zone 5: 200-300px = speed 5 (fast)
+    // Zone 6: 300+px = speed 6 (very fast)
+    fn calculate_scroll_speed(distance: i32, dead_zone: i32) -> i32 {
+        let d = distance.abs();
+        if d <= dead_zone {
+            0
+        } else if d <= 50 {
+            1  // Slow
+        } else if d <= 100 {
+            2  // Medium-slow
+        } else if d <= 150 {
+            3  // Medium
+        } else if d <= 200 {
+            4  // Medium-fast
+        } else if d <= 300 {
+            5  // Fast
+        } else {
+            6  // Very fast
+        }
+    }
 
     while !stop.load(Ordering::Relaxed) {
         let mut had_events = false;
@@ -328,11 +385,33 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                             }
                                             continue;
                                         } else {
+                                            // Check if cursor is over a scrollable area
+                                            let is_scrollable = if let Some((ref conn, root, ref detector)) = scroll_detector {
+                                                detector.should_autoscroll(conn, root)
+                                            } else {
+                                                // No detector available, default to allowing autoscroll everywhere
+                                                true
+                                            };
+                                            
+                                            if !is_scrollable {
+                                                // NOT scrollable - emit a normal middle click and pass through
+                                                debug!("AUTOSCROLL: Area not scrollable - passing through middle click");
+                                                middle_passthrough = true;
+                                                let press = InputEvent::new(EventType::KEY, BTN_MIDDLE, 1);
+                                                let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                                if let Err(e) = vdev.emit(&[press, sync]) {
+                                                    warn!("Failed to emit middle press: {}", e);
+                                                }
+                                                // Don't enter autoscroll mode, continue to let release pass through
+                                                continue;
+                                            }
+                                            
                                             // Start autoscroll (mode determined on release)
                                             info!("AUTOSCROLL: Middle button pressed - entering scroll mode");
                                             autoscroll_active = true;
                                             autoscroll_toggle_mode = false;  // Start as hold mode
                                             autoscroll_moved = false;
+                                            middle_passthrough = false;
                                             middle_press_time = Some(Instant::now());
                                             scroll_tick_counter = 0;
                                             // Set anchor to current cursor position (we'll track relative movement)
@@ -351,21 +430,35 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                         }
                                     } else if ev.value() == 0 {
                                         // Middle button released
+                                        // First check if we're in passthrough mode (non-scrollable area)
+                                        if middle_passthrough {
+                                            debug!("AUTOSCROLL: Passing through middle release (non-scrollable area)");
+                                            middle_passthrough = false;
+                                            let release = InputEvent::new(EventType::KEY, BTN_MIDDLE, 0);
+                                            let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                            if let Err(e) = vdev.emit(&[release, sync]) {
+                                                warn!("Failed to emit middle release: {}", e);
+                                            }
+                                            continue;
+                                        }
+                                        
                                         if autoscroll_active && !autoscroll_toggle_mode {
-                                            // Check if this was a short click (toggle mode) or hold (exit)
-                                            let was_short_click = middle_press_time
-                                                .map(|t| t.elapsed().as_millis() < SHORT_CLICK_THRESHOLD_MS as u128)
-                                                .unwrap_or(false);
+                                            // Determine click duration for behavior:
+                                            // - Quick click (<150ms, no movement): pass through as normal click (for links etc)
+                                            // - Medium hold (150-400ms, no movement): enter toggle autoscroll mode
+                                            // - Long hold or moved: exit autoscroll (hold mode complete)
+                                            let hold_duration = middle_press_time
+                                                .map(|t| t.elapsed().as_millis() as u64)
+                                                .unwrap_or(0);
                                             
-                                            if was_short_click && !autoscroll_moved {
-                                                // Short click with no movement - enter toggle mode
-                                                info!("AUTOSCROLL: Short click - entering toggle mode");
-                                                autoscroll_toggle_mode = true;
-                                                // Stay active, don't hide overlay
-                                                continue;
-                                            } else {
-                                                // Hold mode release or moved - exit autoscroll
-                                                info!("AUTOSCROLL: Hold mode release - exiting (moved={})", autoscroll_moved);
+                                            let was_quick_click = hold_duration < QUICK_CLICK_THRESHOLD_MS;
+                                            let was_toggle_hold = hold_duration >= QUICK_CLICK_THRESHOLD_MS 
+                                                && hold_duration < TOGGLE_MODE_THRESHOLD_MS;
+                                            
+                                            if was_quick_click && !autoscroll_moved {
+                                                // Quick click with no movement - pass through as normal middle click
+                                                // This allows clicking links, paste operations, etc.
+                                                info!("AUTOSCROLL: Quick click - passing through for link/paste");
                                                 autoscroll_active = false;
                                                 middle_press_time = None;
                                                 
@@ -374,15 +467,29 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                                     let _ = sender.send(OverlayCommand::Hide);
                                                 }
                                                 
-                                                // If we didn't move at all, emit a normal middle click
-                                                if !autoscroll_moved {
-                                                    info!("AUTOSCROLL: No movement - emitting normal middle click");
-                                                    let press = InputEvent::new(EventType::KEY, BTN_MIDDLE, 1);
-                                                    let release = InputEvent::new(EventType::KEY, BTN_MIDDLE, 0);
-                                                    let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
-                                                    if let Err(e) = vdev.emit(&[press, sync.clone(), release, sync]) {
-                                                        warn!("Failed to emit middle click: {}", e);
-                                                    }
+                                                // Emit normal middle click
+                                                let press = InputEvent::new(EventType::KEY, BTN_MIDDLE, 1);
+                                                let release = InputEvent::new(EventType::KEY, BTN_MIDDLE, 0);
+                                                let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                                if let Err(e) = vdev.emit(&[press, sync.clone(), release, sync]) {
+                                                    warn!("Failed to emit middle click: {}", e);
+                                                }
+                                                continue;
+                                            } else if was_toggle_hold && !autoscroll_moved {
+                                                // Medium hold with no movement - enter toggle mode
+                                                info!("AUTOSCROLL: Medium hold - entering toggle mode");
+                                                autoscroll_toggle_mode = true;
+                                                // Stay active, don't hide overlay
+                                                continue;
+                                            } else {
+                                                // Long hold or moved - exit autoscroll (hold mode complete)
+                                                info!("AUTOSCROLL: Hold mode release - exiting (moved={})", autoscroll_moved);
+                                                autoscroll_active = false;
+                                                middle_press_time = None;
+                                                
+                                                // Hide overlay indicator
+                                                if let Some(ref sender) = overlay_sender {
+                                                    let _ = sender.send(OverlayCommand::Hide);
                                                 }
                                                 continue;
                                             }
@@ -437,29 +544,28 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                         let dx = cursor_x - anchor_x;
                                         let dy = cursor_y - anchor_y;
                                         
-                                        // Only scroll if beyond threshold
-                                        if dx.abs() > SCROLL_THRESHOLD {
-                                            let scroll_amount = ((dx.abs() - SCROLL_THRESHOLD) as f32 / SCROLL_SPEED_DIVISOR) as i32;
-                                            if scroll_amount > 0 {
-                                                let scroll_val = if dx > 0 { scroll_amount } else { -scroll_amount };
-                                                let scroll_ev = InputEvent::new(EventType::RELATIVE, REL_HWHEEL, scroll_val);
-                                                let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
-                                                if let Err(e) = vdev.emit(&[scroll_ev, sync]) {
-                                                    warn!("Failed to emit hwheel: {}", e);
-                                                }
+                                        // Calculate scroll speed based on distance zones (gradual increase)
+                                        let h_speed = calculate_scroll_speed(dx, SCROLL_DEAD_ZONE);
+                                        let v_speed = calculate_scroll_speed(dy, SCROLL_DEAD_ZONE);
+                                        
+                                        // Horizontal scroll
+                                        if h_speed > 0 {
+                                            let scroll_val = if dx > 0 { h_speed } else { -h_speed };
+                                            let scroll_ev = InputEvent::new(EventType::RELATIVE, REL_HWHEEL, scroll_val);
+                                            let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                            if let Err(e) = vdev.emit(&[scroll_ev, sync]) {
+                                                warn!("Failed to emit hwheel: {}", e);
                                             }
                                         }
                                         
-                                        if dy.abs() > SCROLL_THRESHOLD {
-                                            let scroll_amount = ((dy.abs() - SCROLL_THRESHOLD) as f32 / SCROLL_SPEED_DIVISOR) as i32;
-                                            if scroll_amount > 0 {
-                                                // Negative because mouse down = scroll down (content up)
-                                                let scroll_val = if dy > 0 { -scroll_amount } else { scroll_amount };
-                                                let scroll_ev = InputEvent::new(EventType::RELATIVE, REL_WHEEL, scroll_val);
-                                                let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
-                                                if let Err(e) = vdev.emit(&[scroll_ev, sync]) {
-                                                    warn!("Failed to emit wheel: {}", e);
-                                                }
+                                        // Vertical scroll
+                                        if v_speed > 0 {
+                                            // Negative because mouse down = scroll down (content up)
+                                            let scroll_val = if dy > 0 { -v_speed } else { v_speed };
+                                            let scroll_ev = InputEvent::new(EventType::RELATIVE, REL_WHEEL, scroll_val);
+                                            let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                            if let Err(e) = vdev.emit(&[scroll_ev, sync]) {
+                                                warn!("Failed to emit wheel: {}", e);
                                             }
                                         }
                                         

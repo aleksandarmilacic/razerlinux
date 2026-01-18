@@ -105,11 +105,12 @@ fn run_overlay_loop(rx: Receiver<OverlayCommand>) -> Result<()> {
     // - save_under: save what's behind the window  
     // - backing_store: always maintain window contents
     // - NO pointer/button events - window is "click through"
+    // - background_pixmap NONE for transparency (we'll draw everything ourselves)
     let values = CreateWindowAux::new()
         .override_redirect(1)
         .save_under(1)
         .backing_store(BackingStore::ALWAYS)
-        .background_pixel(screen.black_pixel)
+        .background_pixmap(x11rb::NONE)  // No background for transparency
         .border_pixel(screen.white_pixel)
         .event_mask(EventMask::EXPOSURE);  // Only expose events, no input events
     
@@ -134,6 +135,18 @@ fn run_overlay_loop(rx: Receiver<OverlayCommand>) -> Result<()> {
         &conn,
         shape::SO::SET,
         SK::INPUT,
+        ClipOrdering::UNSORTED,
+        win,
+        0, 0,
+        empty_region,
+    )?;
+    
+    // Also set bounding shape to empty initially - we'll update it when drawing
+    // This makes the window transparent except where we draw
+    shape::rectangles(
+        &conn,
+        shape::SO::SET,
+        SK::BOUNDING,
         ClipOrdering::UNSORTED,
         win,
         0, 0,
@@ -255,11 +268,39 @@ fn draw_indicator<C: Connection>(
     dx: f32,
     dy: f32,
 ) -> Result<()> {
+    use x11rb::protocol::shape::{self, SK};
+    
     let size = INDICATOR_SIZE as i16;
     let center = size / 2;
     
-    // Clear window
-    conn.clear_area(true, win, 0, 0, INDICATOR_SIZE, INDICATOR_SIZE)?;
+    // Set bounding shape to define the visible (non-transparent) region
+    // We create a circular region around the center for the icon
+    let icon_radius = 14i16;  // Radius of the visible icon area
+    let bounding_rects = [
+        // Create a rough circle using rectangles (octagon approximation)
+        Rectangle { x: center - icon_radius + 4, y: center - icon_radius, width: (icon_radius * 2 - 8) as u16, height: (icon_radius * 2) as u16 },
+        Rectangle { x: center - icon_radius + 2, y: center - icon_radius + 2, width: (icon_radius * 2 - 4) as u16, height: (icon_radius * 2 - 4) as u16 },
+        Rectangle { x: center - icon_radius, y: center - icon_radius + 4, width: (icon_radius * 2) as u16, height: (icon_radius * 2 - 8) as u16 },
+    ];
+    shape::rectangles(
+        conn,
+        shape::SO::SET,
+        SK::BOUNDING,
+        ClipOrdering::UNSORTED,
+        win,
+        0, 0,
+        &bounding_rects,
+    )?;
+    
+    // Clear and fill with a semi-dark background for the icon area
+    // First fill the entire window with the background color
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(0x333333))?;
+    conn.poly_fill_rectangle(win, gc, &[
+        Rectangle { x: 0, y: 0, width: INDICATOR_SIZE, height: INDICATOR_SIZE },
+    ])?;
+    
+    // Reset to white for drawing the icon
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(0xFFFFFF))?;
     
     // Windows-style autoscroll icon:
     // - Small filled circle in the center (origin point)

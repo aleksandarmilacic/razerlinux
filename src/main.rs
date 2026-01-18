@@ -10,6 +10,7 @@ mod overlay;
 mod profile;
 mod protocol;
 mod remap;
+mod scroll_detect_x11;
 mod settings;
 mod tray;
 mod tray_helper;

@@ -81,11 +81,19 @@ pub fn run_tray_helper() -> anyhow::Result<()> {
     
     impl ksni::Tray for TrayHelper {
         fn title(&self) -> String {
-            "RazerLinux".to_string()
+            // Add (Debug) suffix for debug builds
+            #[cfg(debug_assertions)]
+            { "RazerLinux (Debug)".to_string() }
+            #[cfg(not(debug_assertions))]
+            { "RazerLinux".to_string() }
         }
         
         fn icon_name(&self) -> String {
-            "input-mouse".to_string()
+            // Use different icon for debug builds to differentiate from release
+            #[cfg(debug_assertions)]
+            { "applications-development".to_string() }
+            #[cfg(not(debug_assertions))]
+            { "input-mouse".to_string() }
         }
         
         fn id(&self) -> String {
