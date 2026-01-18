@@ -79,6 +79,10 @@ fn main() -> Result<()> {
 
     // Create the main window
     let main_window = MainWindow::new()?;
+    
+    // Set application version from Cargo.toml
+    let app_version = env!("CARGO_PKG_VERSION");
+    main_window.set_app_version(app_version.into());
 
     // Shared device state
     let device: Rc<RefCell<Option<device::RazerDevice>>> = Rc::new(RefCell::new(None));

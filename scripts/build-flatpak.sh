@@ -111,6 +111,11 @@ cat > "$PROJECT_DIR/flatpak/org.razerlinux.RazerLinux.metainfo.xml" << EOF
   <url type="bugtracker">https://github.com/aleksandarmilacic/razerlinux/issues</url>
   <developer_name>Aleksandar Milacic</developer_name>
   <releases>
+    <release version="0.2.0" date="2026-01-18">
+      <description>
+        <p>Version 0.2.0 - Improved Windows-style autoscroll</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-01-17">
       <description>
         <p>Initial release with core functionality</p>

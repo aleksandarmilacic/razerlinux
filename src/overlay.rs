@@ -1,7 +1,13 @@
 //! Autoscroll Visual Overlay
 //!
 //! Creates a small X11 overlay window at the cursor position to show
-//! the autoscroll indic                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ator (similar to Windows).
+//! the autoscroll indicator (Windows-style).
+//!
+//! Windows autoscroll icon design:
+//! - Small circle in the center (origin point marker)
+//! - Four triangular arrows pointing up, down, left, right
+//! - Semi-transparent dark background
+//! - Clean, minimal design matching Windows style
 
 use anyhow::{Context, Result};
 use std::sync::mpsc::{self, Sender, Receiver};
@@ -10,8 +16,8 @@ use tracing::{info, error};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 
-/// Size of the overlay indicator (pixels)
-const INDICATOR_SIZE: u16 = 48;
+/// Size of the overlay indicator (pixels) - Windows typically uses ~24-32px
+const INDICATOR_SIZE: u16 = 32;
 
 /// Commands sent to the overlay thread
 #[derive(Debug)]
@@ -245,32 +251,21 @@ fn draw_indicator<C: Connection>(
     conn: &C,
     win: Window,
     gc: Gcontext,
-    gc_fill: Gcontext,
+    _gc_fill: Gcontext,
     dx: f32,
     dy: f32,
 ) -> Result<()> {
     let size = INDICATOR_SIZE as i16;
     let center = size / 2;
-    let radius = (size / 2) - 6;
     
-    // Clear window with dark background
+    // Clear window
     conn.clear_area(true, win, 0, 0, INDICATOR_SIZE, INDICATOR_SIZE)?;
     
-    // Draw filled background circle (dark gray)
-    let bg_gc = gc_fill;  // Reuse for now
-    conn.poly_fill_arc(win, bg_gc, &[Arc {
-        x: center - radius,
-        y: center - radius,
-        width: (radius * 2) as u16,
-        height: (radius * 2) as u16,
-        angle1: 0,
-        angle2: 360 * 64,
-    }])?;
+    // Windows-style autoscroll icon:
+    // - Small filled circle in the center (origin point)
+    // - Four directional arrows around it
     
-    // Draw outer circle border (white)
-    draw_circle(conn, win, gc, center, center, radius)?;
-    
-    // Draw center dot (small white circle)
+    // Draw center dot (origin point) - small filled circle
     let dot_radius = 3i16;
     conn.poly_fill_arc(win, gc, &[Arc {
         x: center - dot_radius,
@@ -281,35 +276,43 @@ fn draw_indicator<C: Connection>(
         angle2: 360 * 64,
     }])?;
     
-    // Draw directional arrows based on scroll direction
-    let arrow_len = 6i16;
-    let arrow_offset = 10i16;
+    // Arrow positioning - closer to center like Windows
+    let arrow_offset = 9i16;  // Distance from center to arrow
+    let arrow_size = 4i16;    // Size of arrow triangles
     
-    // Calculate which arrows to show based on direction
+    // Calculate which arrows to show based on scroll direction
     let show_up = dy < -0.3;
     let show_down = dy > 0.3;
     let show_left = dx < -0.3;
     let show_right = dx > 0.3;
     let show_all = !show_up && !show_down && !show_left && !show_right;
     
-    // Up arrow
+    // Up arrow (filled triangle pointing up)
     if show_up || show_all {
-        draw_arrow_up(conn, win, gc, center, center - arrow_offset, arrow_len, show_up)?;
+        let tip_y = center - arrow_offset - arrow_size;
+        let base_y = center - arrow_offset + 1;
+        draw_filled_arrow_up(conn, win, gc, center, tip_y, base_y, arrow_size)?;
     }
     
-    // Down arrow
+    // Down arrow (filled triangle pointing down)
     if show_down || show_all {
-        draw_arrow_down(conn, win, gc, center, center + arrow_offset, arrow_len, show_down)?;
+        let tip_y = center + arrow_offset + arrow_size;
+        let base_y = center + arrow_offset - 1;
+        draw_filled_arrow_down(conn, win, gc, center, tip_y, base_y, arrow_size)?;
     }
     
-    // Left arrow
+    // Left arrow (filled triangle pointing left)
     if show_left || show_all {
-        draw_arrow_left(conn, win, gc, center - arrow_offset, center, arrow_len, show_left)?;
+        let tip_x = center - arrow_offset - arrow_size;
+        let base_x = center - arrow_offset + 1;
+        draw_filled_arrow_left(conn, win, gc, tip_x, center, base_x, arrow_size)?;
     }
     
-    // Right arrow
+    // Right arrow (filled triangle pointing right)
     if show_right || show_all {
-        draw_arrow_right(conn, win, gc, center + arrow_offset, center, arrow_len, show_right)?;
+        let tip_x = center + arrow_offset + arrow_size;
+        let base_x = center + arrow_offset - 1;
+        draw_filled_arrow_right(conn, win, gc, tip_x, center, base_x, arrow_size)?;
     }
     
     conn.flush()?;
@@ -335,79 +338,81 @@ fn draw_circle<C: Connection>(
     Ok(())
 }
 
-fn draw_arrow_up<C: Connection>(
+// Windows-style filled arrow functions
+// These draw solid triangular arrows pointing in each direction
+
+fn draw_filled_arrow_up<C: Connection>(
     conn: &C,
     win: Window,
     gc: Gcontext,
     x: i16,
-    y: i16,
-    len: i16,
-    _active: bool,
+    tip_y: i16,
+    base_y: i16,
+    half_width: i16,
 ) -> Result<()> {
-    // Simple triangle pointing up
+    // Filled triangle pointing up
     let points = [
-        Point { x, y: y - len/2 },           // Top
-        Point { x: x - len/2, y: y + len/2 }, // Bottom left
-        Point { x: x + len/2, y: y + len/2 }, // Bottom right
-        Point { x, y: y - len/2 },           // Back to top
+        Point { x, y: tip_y },                    // Top tip
+        Point { x: x - half_width, y: base_y },   // Bottom left
+        Point { x: x + half_width, y: base_y },   // Bottom right
     ];
-    conn.poly_line(CoordMode::ORIGIN, win, gc, &points)?;
+    conn.fill_poly(win, gc, PolyShape::CONVEX, CoordMode::ORIGIN, &points)?;
     Ok(())
 }
 
-fn draw_arrow_down<C: Connection>(
+fn draw_filled_arrow_down<C: Connection>(
     conn: &C,
     win: Window,
     gc: Gcontext,
     x: i16,
-    y: i16,
-    len: i16,
-    _active: bool,
+    tip_y: i16,
+    base_y: i16,
+    half_width: i16,
 ) -> Result<()> {
+    // Filled triangle pointing down
     let points = [
-        Point { x, y: y + len/2 },           // Bottom
-        Point { x: x - len/2, y: y - len/2 }, // Top left
-        Point { x: x + len/2, y: y - len/2 }, // Top right
-        Point { x, y: y + len/2 },           // Back to bottom
+        Point { x, y: tip_y },                    // Bottom tip
+        Point { x: x - half_width, y: base_y },   // Top left
+        Point { x: x + half_width, y: base_y },   // Top right
     ];
-    conn.poly_line(CoordMode::ORIGIN, win, gc, &points)?;
+    conn.fill_poly(win, gc, PolyShape::CONVEX, CoordMode::ORIGIN, &points)?;
     Ok(())
 }
 
-fn draw_arrow_left<C: Connection>(
+fn draw_filled_arrow_left<C: Connection>(
     conn: &C,
     win: Window,
     gc: Gcontext,
-    x: i16,
+    tip_x: i16,
     y: i16,
-    len: i16,
-    _active: bool,
+    base_x: i16,
+    half_height: i16,
 ) -> Result<()> {
+    // Filled triangle pointing left
     let points = [
-        Point { x: x - len/2, y },           // Left
-        Point { x: x + len/2, y: y - len/2 }, // Top right
-        Point { x: x + len/2, y: y + len/2 }, // Bottom right
-        Point { x: x - len/2, y },           // Back to left
+        Point { x: tip_x, y },                    // Left tip
+        Point { x: base_x, y: y - half_height },  // Top right
+        Point { x: base_x, y: y + half_height },  // Bottom right
     ];
-    conn.poly_line(CoordMode::ORIGIN, win, gc, &points)?;
+    conn.fill_poly(win, gc, PolyShape::CONVEX, CoordMode::ORIGIN, &points)?;
     Ok(())
 }
 
-fn draw_arrow_right<C: Connection>(
+fn draw_filled_arrow_right<C: Connection>(
     conn: &C,
     win: Window,
     gc: Gcontext,
-    x: i16,
+    tip_x: i16,
     y: i16,
-    len: i16,
-    _active: bool,
+    base_x: i16,
+    half_height: i16,
 ) -> Result<()> {
+    // Filled triangle pointing right
     let points = [
-        Point { x: x + len/2, y },           // Right
-        Point { x: x - len/2, y: y - len/2 }, // Top left
-        Point { x: x - len/2, y: y + len/2 }, // Bottom left
-        Point { x: x + len/2, y },           // Back to right
+        Point { x: tip_x, y },                    // Right tip
+        Point { x: base_x, y: y - half_height },  // Top left
+        Point { x: base_x, y: y + half_height },  // Bottom left
     ];
-    conn.poly_line(CoordMode::ORIGIN, win, gc, &points)?;
+    conn.fill_poly(win, gc, PolyShape::CONVEX, CoordMode::ORIGIN, &points)?;
     Ok(())
 }

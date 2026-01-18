@@ -278,18 +278,23 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
     info!("Active mappings: {:?}", config.mappings);
     info!("Autoscroll enabled: {}", config.autoscroll_enabled);
 
-    // Autoscroll state - Windows style: cursor moves, distance from anchor controls scroll
+    // Autoscroll state - Windows style with two modes:
+    // 1. Hold Mode: Press and hold middle button, release to exit
+    // 2. Toggle Mode: Short click to enter, click any button to exit
     let mut autoscroll_active = false;
+    let mut autoscroll_toggle_mode = false;  // true = toggle mode (click to exit), false = hold mode
     let mut autoscroll_moved = false;  // Track if mouse moved during autoscroll
+    let mut middle_press_time: Option<Instant> = None;  // Track when middle button was pressed
     let mut anchor_x: i32 = 0;  // Anchor point X (where middle-click happened)
     let mut anchor_y: i32 = 0;  // Anchor point Y
     let mut cursor_x: i32 = 0;  // Current cursor position X
     let mut cursor_y: i32 = 0;  // Current cursor position Y
     let mut scroll_tick_counter: u32 = 0;  // For throttling scroll events
-    const SCROLL_THRESHOLD: i32 = 20;  // Pixels from anchor before scrolling starts
-    const SCROLL_SPEED_DIVISOR: f32 = 50.0;  // Higher = slower scrolling
-    const SCROLL_TICK_INTERVAL: u32 = 5;  // Emit scroll every N movement events
-    const DIRECTION_UPDATE_INTERVAL: u32 = 20;  // Update overlay direction every N events
+    const SCROLL_THRESHOLD: i32 = 15;  // Pixels from anchor before scrolling starts (dead zone)
+    const SCROLL_SPEED_DIVISOR: f32 = 40.0;  // Higher = slower scrolling
+    const SCROLL_TICK_INTERVAL: u32 = 4;  // Emit scroll every N movement events
+    const DIRECTION_UPDATE_INTERVAL: u32 = 15;  // Update overlay direction every N events
+    const SHORT_CLICK_THRESHOLD_MS: u64 = 200;  // Max ms for short click (toggle mode)
     const BTN_MIDDLE: u16 = 274;
     const REL_WHEEL: u16 = 8;
     const REL_HWHEEL: u16 = 6;
@@ -309,46 +314,81 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                             if let InputEventKind::Key(key) = ev.kind() {
                                 if key.code() == BTN_MIDDLE {
                                     if ev.value() == 1 {
-                                        // Middle button pressed - enter autoscroll mode
-                                        info!("AUTOSCROLL: Middle button pressed - entering scroll mode");
-                                        autoscroll_active = true;
-                                        autoscroll_moved = false;
-                                        scroll_tick_counter = 0;
-                                        // Set anchor to current cursor position (we'll track relative movement)
-                                        anchor_x = 0;
-                                        anchor_y = 0;
-                                        cursor_x = 0;
-                                        cursor_y = 0;
-                                        
-                                        // Show overlay indicator
-                                        if let Some(ref sender) = overlay_sender {
-                                            let _ = sender.send(OverlayCommand::Show);
-                                        }
-                                        
-                                        // Don't pass through the middle button press
-                                        continue;
-                                    } else if ev.value() == 0 {
-                                        // Middle button released
-                                        if autoscroll_active {
-                                            info!("AUTOSCROLL: Middle button released - exiting scroll mode (moved={})", autoscroll_moved);
+                                        // Middle button pressed
+                                        if autoscroll_active && autoscroll_toggle_mode {
+                                            // Already in toggle mode - exit on middle click
+                                            info!("AUTOSCROLL: Middle click in toggle mode - exiting");
                                             autoscroll_active = false;
+                                            autoscroll_toggle_mode = false;
+                                            middle_press_time = None;
                                             
                                             // Hide overlay indicator
                                             if let Some(ref sender) = overlay_sender {
                                                 let _ = sender.send(OverlayCommand::Hide);
                                             }
+                                            continue;
+                                        } else {
+                                            // Start autoscroll (mode determined on release)
+                                            info!("AUTOSCROLL: Middle button pressed - entering scroll mode");
+                                            autoscroll_active = true;
+                                            autoscroll_toggle_mode = false;  // Start as hold mode
+                                            autoscroll_moved = false;
+                                            middle_press_time = Some(Instant::now());
+                                            scroll_tick_counter = 0;
+                                            // Set anchor to current cursor position (we'll track relative movement)
+                                            anchor_x = 0;
+                                            anchor_y = 0;
+                                            cursor_x = 0;
+                                            cursor_y = 0;
                                             
-                                            // If we didn't move, emit a normal middle click
-                                            if !autoscroll_moved {
-                                                info!("AUTOSCROLL: No movement - emitting normal middle click");
-                                                let press = InputEvent::new(EventType::KEY, BTN_MIDDLE, 1);
-                                                let release = InputEvent::new(EventType::KEY, BTN_MIDDLE, 0);
-                                                let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
-                                                if let Err(e) = vdev.emit(&[press, sync.clone(), release, sync]) {
-                                                    warn!("Failed to emit middle click: {}", e);
-                                                }
+                                            // Show overlay indicator
+                                            if let Some(ref sender) = overlay_sender {
+                                                let _ = sender.send(OverlayCommand::Show);
                                             }
-                                            // Don't pass through the middle button release
+                                            
+                                            // Don't pass through the middle button press
+                                            continue;
+                                        }
+                                    } else if ev.value() == 0 {
+                                        // Middle button released
+                                        if autoscroll_active && !autoscroll_toggle_mode {
+                                            // Check if this was a short click (toggle mode) or hold (exit)
+                                            let was_short_click = middle_press_time
+                                                .map(|t| t.elapsed().as_millis() < SHORT_CLICK_THRESHOLD_MS as u128)
+                                                .unwrap_or(false);
+                                            
+                                            if was_short_click && !autoscroll_moved {
+                                                // Short click with no movement - enter toggle mode
+                                                info!("AUTOSCROLL: Short click - entering toggle mode");
+                                                autoscroll_toggle_mode = true;
+                                                // Stay active, don't hide overlay
+                                                continue;
+                                            } else {
+                                                // Hold mode release or moved - exit autoscroll
+                                                info!("AUTOSCROLL: Hold mode release - exiting (moved={})", autoscroll_moved);
+                                                autoscroll_active = false;
+                                                middle_press_time = None;
+                                                
+                                                // Hide overlay indicator
+                                                if let Some(ref sender) = overlay_sender {
+                                                    let _ = sender.send(OverlayCommand::Hide);
+                                                }
+                                                
+                                                // If we didn't move at all, emit a normal middle click
+                                                if !autoscroll_moved {
+                                                    info!("AUTOSCROLL: No movement - emitting normal middle click");
+                                                    let press = InputEvent::new(EventType::KEY, BTN_MIDDLE, 1);
+                                                    let release = InputEvent::new(EventType::KEY, BTN_MIDDLE, 0);
+                                                    let sync = InputEvent::new(EventType::SYNCHRONIZATION, 0, 0);
+                                                    if let Err(e) = vdev.emit(&[press, sync.clone(), release, sync]) {
+                                                        warn!("Failed to emit middle click: {}", e);
+                                                    }
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                        // In toggle mode, middle release is ignored (already handled on press)
+                                        if autoscroll_toggle_mode {
                                             continue;
                                         }
                                     }
@@ -358,6 +398,8 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                 if autoscroll_active && ev.value() == 1 {
                                     info!("AUTOSCROLL: Other button pressed - exiting scroll mode");
                                     autoscroll_active = false;
+                                    autoscroll_toggle_mode = false;
+                                    middle_press_time = None;
                                     
                                     // Hide overlay indicator
                                     if let Some(ref sender) = overlay_sender {

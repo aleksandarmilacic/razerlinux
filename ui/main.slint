@@ -91,6 +91,9 @@ export component MainWindow inherits Window {
     min-height: 650px;
     background: #1a1a2e;
     
+    // Application version (set from Cargo.toml via main.rs)
+    in-out property <string> app-version: "0.2.0";
+    
     // Device properties
     in-out property <string> device-name: "No device connected";
     in-out property <string> firmware-version: "-";
@@ -1787,7 +1790,7 @@ export component MainWindow inherits Window {
                                             color: #22c55e;
                                         }
                                         Text {
-                                            text: "Version 0.1.0";
+                                            text: "Version " + app-version;
                                             font-size: 11px;
                                             color: #888899;
                                         }
@@ -1859,7 +1862,7 @@ export component MainWindow inherits Window {
         
         // Footer
         Text {
-            text: "RazerLinux v0.1.0 • GPL-3.0-only";
+            text: "RazerLinux v" + app-version + " • GPL-3.0-only";
             font-size: 10px;
             color: #888899;
             horizontal-alignment: center;

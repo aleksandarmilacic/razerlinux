@@ -54,12 +54,14 @@ A userspace Razer mouse configuration tool for Linux. No kernel drivers required
 - **Button Learning** - Click "🎯 Learn Button" to capture any mouse button
 - **Side Panel Support** - Automatic Driver Mode switching for Naga Trinity 12-button panel
 
-### Windows-Style Autoscroll ✨ NEW
-- **Middle-Click Autoscroll** - Hold middle mouse button to enable continuous scrolling
-- **Visual Indicator** - X11 overlay shows anchor point with directional arrows
+### Windows-Style Autoscroll ✨ v0.2.0
+- **Two Activation Modes** - Hold mode (press and hold) or Toggle mode (short click to lock)
+- **Middle-Click Autoscroll** - Press middle mouse button to enable continuous scrolling
+- **Visual Indicator** - Windows-style overlay with center dot and directional arrows
 - **Distance-Based Speed** - Scroll speed increases as you move further from the anchor point
 - **Free Cursor Movement** - Mouse cursor moves freely while autoscrolling (like Windows)
 - **Click-Through Overlay** - Indicator doesn't interfere with mouse input
+- **Smart Mode Detection** - Short click (<200ms) enters toggle mode, hold enters drag mode
 
 ## Supported Devices
 
@@ -185,15 +187,20 @@ Enable the "Windows Autoscroll" checkbox in the Remapping panel to get Windows-l
 
 1. **Enable Remapping** - Turn on button remapping first
 2. **Check "Windows Autoscroll"** - Enables the autoscroll feature
-3. **Middle-Click and Hold** - A visual indicator appears at the anchor point
+3. **Activate Autoscroll**:
+   - **Hold Mode**: Press and hold middle mouse button - scrolling while held
+   - **Toggle Mode**: Quick click (<200ms) middle mouse button - stays active until next click
 4. **Move Mouse** - Cursor moves freely; scrolling happens based on distance from anchor
-5. **Release or Click** - Any mouse button click exits autoscroll mode
+5. **Exit Autoscroll**:
+   - **Hold Mode**: Release middle button
+   - **Toggle Mode**: Click any mouse button
 
 **Behavior:**
-- **Scroll Threshold**: 20 pixels - no scrolling until you move this far from anchor
+- **Dead Zone**: 15 pixels - no scrolling until you move this far from anchor
 - **Speed**: Proportional to distance from anchor point (further = faster)
 - **Direction Arrows**: Visual indicator shows active scroll direction
 - **Click-Through**: The overlay window doesn't intercept mouse clicks
+- **Smart Detection**: Short click with no movement enters toggle mode automatically
 
 #### Profile Management
 - Save current settings to named profiles
