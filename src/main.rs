@@ -228,17 +228,21 @@ fn main() -> Result<()> {
     // Run the GUI event loop
     info!("Starting GUI...");
     
-    // If starting minimized with tray connected, show then immediately hide
-    // This is required because Slint creates the window regardless, and we need
-    // to properly hide it from the taskbar
+    // Always show the window initially - Slint's event loop needs at least one window
+    // to have been shown to keep running properly
+    main_window.show()?;
+    
+    // If starting minimized with tray connected, immediately request hide
+    // Using a short timer ensures the window is properly initialized first
     if start_minimized && tray_connected {
-        info!("Starting hidden to tray (window not shown)");
-        // Show briefly then hide - this properly initializes and hides the window
-        main_window.show()?;
-        main_window.hide()?;
-    } else {
-        // Normal startup - show the window
-        main_window.show()?;
+        info!("Starting minimized to tray - will hide shortly");
+        let window_weak = main_window.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(100), move || {
+            if let Some(window) = window_weak.upgrade() {
+                info!("Hiding window to tray after startup");
+                window.hide().ok();
+            }
+        });
     }
     
     // Use run_event_loop_until_quit() so the app keeps running even when all windows
