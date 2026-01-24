@@ -228,12 +228,14 @@ fn main() -> Result<()> {
     // Run the GUI event loop
     info!("Starting GUI...");
     
-    // If starting minimized with tray connected, don't show window at all
-    // The tray icon click will call window.show() when user wants to see it
+    // If starting minimized with tray connected, show then immediately hide
+    // This is required because Slint creates the window regardless, and we need
+    // to properly hide it from the taskbar
     if start_minimized && tray_connected {
         info!("Starting hidden to tray (window not shown)");
-        // We still need to "show" internally for Slint, but hide immediately
-        // Actually, Slint's run_event_loop_until_quit works without showing
+        // Show briefly then hide - this properly initializes and hides the window
+        main_window.show()?;
+        main_window.hide()?;
     } else {
         // Normal startup - show the window
         main_window.show()?;
