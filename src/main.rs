@@ -4,24 +4,30 @@
 //! without requiring kernel drivers.
 
 mod device;
+mod display_backend;
 mod hidpoll;
 mod macro_engine;
-mod overlay;
 mod profile;
 mod protocol;
 mod remap;
-mod scroll_detect_x11;
 mod settings;
 mod tray;
 mod tray_helper;
 
+// Keep old overlay module for backward compatibility during transition
+mod overlay;
+
 use anyhow::Result;
+#[allow(unused_imports)]
+use display_backend::{DisplayBackend, OverlayCommand, OverlayDisplay};
 use profile::{Profile, ProfileManager};
 use settings::AppSettings;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
 use std::rc::Rc;
+#[allow(unused_imports)]
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -1328,7 +1334,7 @@ fn start_remapper(
                 poller.stop();
             }
             // Clean up overlay
-            if let Some(ol) = autoscroll_overlay.borrow_mut().take() {
+            if let Some(mut ol) = autoscroll_overlay.borrow_mut().take() {
                 ol.shutdown();
             }
             win.set_remap_enabled(false);
@@ -1354,7 +1360,7 @@ fn stop_remapper(
     }
     
     // Stop the autoscroll overlay
-    if let Some(ol) = autoscroll_overlay.borrow_mut().take() {
+    if let Some(mut ol) = autoscroll_overlay.borrow_mut().take() {
         ol.shutdown();
         info!("Autoscroll overlay stopped");
     }

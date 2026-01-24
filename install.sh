@@ -124,13 +124,45 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Auto-detect DISPLAY and XAUTHORITY if not set (happens in systemd services)
+if [ -z "$DISPLAY" ]; then
+    # Try to get DISPLAY from any running Xwayland or X process
+    DISPLAY=$(pgrep -a Xwayland 2>/dev/null | grep -oP ':\d+' | head -1)
+    if [ -z "$DISPLAY" ]; then
+        DISPLAY=":0"  # Fallback
+    fi
+    export DISPLAY
+fi
+
+if [ -z "$XAUTHORITY" ]; then
+    # Look for xauth files in XDG_RUNTIME_DIR
+    RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    for auth in "$RUNTIME_DIR"/xauth_* "$HOME/.Xauthority"; do
+        if [ -f "$auth" ]; then
+            export XAUTHORITY="$auth"
+            break
+        fi
+    done
+fi
+
+# Determine socket path
+SOCKET_PATH="${XDG_RUNTIME_DIR:-/tmp/razerlinux-$(id -u)}/razerlinux-tray.sock"
+
 # Start the tray helper as the current user (runs in user session for tray icon)
 # The tray helper creates a Unix socket for IPC with the main app
 /opt/razerlinux/razerlinux --tray-helper &
 TRAY_PID=$!
 
-# Give the tray helper time to start and create the socket
-sleep 0.3
+# Wait for the socket to be created (up to 5 seconds)
+WAIT_COUNT=0
+while [ ! -S "$SOCKET_PATH" ] && [ $WAIT_COUNT -lt 50 ]; do
+    sleep 0.1
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+done
+
+if [ ! -S "$SOCKET_PATH" ]; then
+    echo "Warning: Tray helper socket not ready after 5 seconds"
+fi
 
 # Find Razer hidraw device and check if we can access it
 RAZER_HIDRAW=""

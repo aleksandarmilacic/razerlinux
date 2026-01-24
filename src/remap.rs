@@ -1,7 +1,6 @@
 //! Software button remapping (evdev grab + uinput virtual device)
 
-use crate::overlay::OverlayCommand;
-use crate::scroll_detect_x11::ScrollDetectorX11;
+use crate::display_backend::{DisplayBackend, OverlayCommand, ScrollDetector};
 use anyhow::{Context, Result};
 use evdev::{AttributeSet, Device, EventType, InputEvent, InputEventKind, Key, uinput::VirtualDeviceBuilder};
 use std::collections::BTreeMap;
@@ -15,7 +14,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn, debug};
-use x11rb::connection::Connection;
 
 #[derive(Debug, Clone, Default)]
 pub struct RemapConfig {
@@ -70,6 +68,104 @@ impl Modifiers {
 
         codes.into_iter().take(len)
     }
+}
+
+/// Get cursor position from KWin (Plasma Wayland) using a script
+/// This is the only reliable method on Wayland since xdotool returns stale XWayland positions
+fn get_cursor_position_kwin() -> Option<(i32, i32)> {
+    use std::io::Write;
+    use std::process::Command;
+    
+    // Check if we're on Wayland with KDE
+    let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    
+    if session_type != "wayland" || !desktop.to_lowercase().contains("kde") {
+        debug!("KWin cursor: Not on KDE Wayland (session={}, desktop={})", session_type, desktop);
+        return None;
+    }
+    
+    // Create a unique marker for this query
+    let marker = format!("RAZERLINUX_CURSOR_{}", std::process::id());
+    
+    // Create temporary script
+    let script_content = format!(
+        "var pos = workspace.cursorPos;\nprint(\"{}: \" + pos.x + \",\" + pos.y);",
+        marker
+    );
+    
+    let script_path = "/tmp/razerlinux_cursor.js";
+    if let Ok(mut file) = std::fs::File::create(script_path) {
+        if file.write_all(script_content.as_bytes()).is_err() {
+            debug!("KWin cursor: Failed to write script file");
+            return None;
+        }
+    } else {
+        debug!("KWin cursor: Failed to create script file");
+        return None;
+    }
+    
+    // Load the script via qdbus6
+    let load_result = Command::new("qdbus6")
+        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", script_path])
+        .output();
+        
+    match &load_result {
+        Ok(output) => {
+            if !output.status.success() {
+                debug!("KWin cursor: qdbus6 loadScript failed with status {:?}", output.status);
+                let _ = std::fs::remove_file(script_path);
+                return None;
+            }
+            debug!("KWin cursor: Script loaded successfully");
+        }
+        Err(e) => {
+            debug!("KWin cursor: qdbus6 command failed: {}", e);
+            let _ = std::fs::remove_file(script_path);
+            return None;
+        }
+    }
+    
+    // Start the scripting system to execute the script
+    let _ = Command::new("qdbus6")
+        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.start"])
+        .output();
+    
+    // Give the script a moment to execute (50ms is enough based on testing)
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    
+    // Read the output from journalctl
+    if let Ok(output) = Command::new("journalctl")
+        .args(["--user", "-n", "30", "--since", "10 seconds ago", "--no-pager", "-o", "cat"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        debug!("KWin cursor: Looking for marker '{}' in {} journal lines", marker, stdout.lines().count());
+        for line in stdout.lines().rev() {
+            // KWin script output format: "js: MARKER: x,y"
+            if line.contains(&marker) {
+                // Try to extract coordinates after the marker
+                if let Some(pos) = line.find(&format!("{}: ", marker)) {
+                    let after_marker = &line[pos + marker.len() + 2..]; // +2 for ": "
+                    let parts: Vec<&str> = after_marker.split(',').collect();
+                    if parts.len() >= 2 {
+                        if let (Ok(x), Ok(y)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) {
+                            info!("KWin cursor: Got position from KWin script: ({}, {})", x, y);
+                            let _ = std::fs::remove_file(script_path);
+                            return Some((x, y));
+                        }
+                    }
+                }
+            }
+        }
+        debug!("KWin cursor: Marker not found in journal output");
+    } else {
+        debug!("KWin cursor: journalctl command failed");
+    }
+    
+    // Clean up
+    let _ = std::fs::remove_file(script_path);
+    None
 }
 
 /// Information about a detected Razer input interface
@@ -192,33 +288,24 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
     let overlay_sender = ext_config.overlay_sender;
     let macros = ext_config.macros;
     
-    // Initialize X11 scroll detector for Windows-like autoscroll behavior
+    // Initialize scroll detector for Windows-like autoscroll behavior
     // This detects if the cursor is over a scrollable area (not desktop/dock/menu)
-    let scroll_detector: Option<(x11rb::rust_connection::RustConnection, u32, ScrollDetectorX11)> = 
-        if config.autoscroll_enabled {
-            match x11rb::connect(None) {
-                Ok((conn, screen_num)) => {
-                    let screen = &conn.setup().roots[screen_num];
-                    let root = screen.root;
-                    match ScrollDetectorX11::new(&conn) {
-                        Ok(detector) => {
-                            info!("X11 scroll detector initialized (root window: {})", root);
-                            Some((conn, root, detector))
-                        }
-                        Err(e) => {
-                            warn!("Failed to initialize scroll detector: {} - autoscroll will work everywhere", e);
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to connect to X11: {} - autoscroll will work everywhere", e);
-                    None
-                }
+    // Uses the display backend abstraction to support both X11 and Wayland
+    let scroll_detector: Option<Box<dyn ScrollDetector>> = if config.autoscroll_enabled {
+        let backend = DisplayBackend::new();
+        match backend.create_scroll_detector() {
+            Some(detector) => {
+                info!("Scroll detector initialized for {}", backend.display_server().name());
+                Some(detector)
             }
-        } else {
-            None
-        };
+            None => {
+                warn!("No scroll detector available - autoscroll will work everywhere");
+                None
+            }
+        }
+    } else {
+        None
+    };
     
     // Find ALL Razer keyboard interfaces - the Naga Trinity sends side button keys
     // through multiple interfaces (event9 AND event11), so we need to grab them all
@@ -227,6 +314,43 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
     if source_paths.is_empty() {
         anyhow::bail!("No suitable Razer keyboard interfaces found for remapping");
     }
+
+    // IMPORTANT: Get initial cursor position BEFORE grabbing devices!
+    // Once we grab evdev devices, xdotool/X11 won't see hardware mouse movements anymore
+    // (especially on Wayland/XWayland where the position gets "frozen")
+    let (initial_cursor_x, initial_cursor_y): (i32, i32) = {
+        // On Wayland/KDE, try KWin script first - this is the ONLY reliable method
+        // xdotool returns stale positions on XWayland
+        if let Some(pos) = get_cursor_position_kwin() {
+            info!("Initial cursor position from KWin (BEFORE grab): ({}, {})", pos.0, pos.1);
+            pos
+        } else if let Ok(output) = std::process::Command::new("xdotool")
+            .args(["getmouselocation", "--shell"])
+            .output()
+        {
+            // Fallback to xdotool (works on X11, may be stale on XWayland)
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut x = 0i32;
+            let mut y = 0i32;
+            for line in stdout.lines() {
+                if let Some(val) = line.strip_prefix("X=") {
+                    x = val.parse().unwrap_or(0);
+                } else if let Some(val) = line.strip_prefix("Y=") {
+                    y = val.parse().unwrap_or(0);
+                }
+            }
+            info!("Initial cursor position from xdotool (BEFORE grab): ({}, {})", x, y);
+            (x, y)
+        } else if let Some(ref detector) = scroll_detector {
+            // Fallback to scroll detector
+            let pos = detector.cursor_position().unwrap_or((0, 0));
+            info!("Initial cursor position from scroll detector: ({}, {})", pos.0, pos.1);
+            pos
+        } else {
+            warn!("Could not get initial cursor position - overlay may appear at wrong location");
+            (0, 0)
+        }
+    };
 
     info!("Starting remapper on {} device(s): {:?}", source_paths.len(), source_paths);
 
@@ -318,14 +442,24 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
     let mut middle_passthrough = false;  // Track if middle press was passed through (non-scrollable area)
     let mut anchor_x: i32 = 0;  // Anchor point X (where middle-click happened)
     let mut anchor_y: i32 = 0;  // Anchor point Y
-    let mut cursor_x: i32 = 0;  // Current cursor position X
-    let mut cursor_y: i32 = 0;  // Current cursor position Y
+    let mut cursor_x: i32 = 0;  // Current cursor position X (relative to anchor)
+    let mut cursor_y: i32 = 0;  // Current cursor position Y (relative to anchor)
+    
+    // Absolute cursor position tracking (for overlay positioning)
+    // Use the position we captured BEFORE grabbing devices
+    let (mut abs_cursor_x, mut abs_cursor_y) = (initial_cursor_x, initial_cursor_y);
+    // Screen bounds for clamping (approximate - could be queried from X11)
+    const SCREEN_WIDTH: i32 = 7680;   // Max reasonable multi-monitor width
+    const SCREEN_HEIGHT: i32 = 4320;  // Max reasonable multi-monitor height
+    
     let mut scroll_tick_counter: u32 = 0;  // For throttling scroll events
+    let mut autoscroll_start_time: Option<Instant> = None;  // When autoscroll was activated
     const SCROLL_DEAD_ZONE: i32 = 15;  // Pixels from anchor before scrolling starts
     const SCROLL_TICK_INTERVAL: u32 = 3;  // Emit scroll every N movement events
     const DIRECTION_UPDATE_INTERVAL: u32 = 12;  // Update overlay direction every N events
     const QUICK_CLICK_THRESHOLD_MS: u64 = 150;  // Max ms for quick click (pass through for links etc)
     const TOGGLE_MODE_THRESHOLD_MS: u64 = 400;  // Max ms for toggle mode (between quick click and hold)
+    const SCROLL_GRACE_PERIOD_MS: u64 = 0;  // No delay - scroll detection starts immediately
     const BTN_MIDDLE: u16 = 274;
     const REL_WHEEL: u16 = 8;
     const REL_HWHEEL: u16 = 6;
@@ -356,6 +490,31 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
         }
     }
 
+    // Get current cursor position using xdotool (works on Wayland/XWayland)
+    // Note: This only works reliably before device grab or after events are emitted to uinput
+    fn get_cursor_position_xdotool() -> (i32, i32) {
+        // Small delay to let X server process any pending uinput events
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        if let Ok(output) = std::process::Command::new("xdotool")
+            .args(["getmouselocation", "--shell"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut x = 0i32;
+            let mut y = 0i32;
+            for line in stdout.lines() {
+                if let Some(val) = line.strip_prefix("X=") {
+                    x = val.parse().unwrap_or(0);
+                } else if let Some(val) = line.strip_prefix("Y=") {
+                    y = val.parse().unwrap_or(0);
+                }
+            }
+            (x, y)
+        } else {
+            (0, 0)
+        }
+    }
+
     while !stop.load(Ordering::Relaxed) {
         let mut had_events = false;
         
@@ -364,6 +523,20 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                 Ok(events) => {
                     for ev in events {
                         had_events = true;
+                        
+                        // Track absolute cursor position FIRST (before any other processing)
+                        // This ensures we have up-to-date position when middle button is pressed
+                        if let InputEventKind::RelAxis(axis) = ev.kind() {
+                            match axis {
+                                evdev::RelativeAxisType::REL_X => {
+                                    abs_cursor_x = (abs_cursor_x + ev.value()).clamp(0, SCREEN_WIDTH);
+                                }
+                                evdev::RelativeAxisType::REL_Y => {
+                                    abs_cursor_y = (abs_cursor_y + ev.value()).clamp(0, SCREEN_HEIGHT);
+                                }
+                                _ => {}
+                            }
+                        }
                         
                         // Handle autoscroll if enabled
                         if config.autoscroll_enabled {
@@ -386,8 +559,8 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                             continue;
                                         } else {
                                             // Check if cursor is over a scrollable area
-                                            let is_scrollable = if let Some((ref conn, root, ref detector)) = scroll_detector {
-                                                detector.should_autoscroll(conn, root)
+                                            let is_scrollable = if let Some(ref detector) = scroll_detector {
+                                                detector.should_autoscroll()
                                             } else {
                                                 // No detector available, default to allowing autoscroll everywhere
                                                 true
@@ -414,16 +587,31 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                             middle_passthrough = false;
                                             middle_press_time = Some(Instant::now());
                                             scroll_tick_counter = 0;
-                                            // Set anchor to current cursor position (we'll track relative movement)
+                                            // Show overlay indicator at cursor position
+                                            // Get fresh position from KWin (accurate on Wayland)
+                                            // Fall back to tracked position if KWin fails
+                                            if let Some(ref sender) = overlay_sender {
+                                                let (show_x, show_y) = if let Some((kx, ky)) = get_cursor_position_kwin() {
+                                                    info!("AUTOSCROLL: Got fresh KWin position ({}, {})", kx, ky);
+                                                    (kx, ky)
+                                                } else {
+                                                    info!("AUTOSCROLL: KWin failed, using tracked position ({}, {})", abs_cursor_x, abs_cursor_y);
+                                                    (abs_cursor_x, abs_cursor_y)
+                                                };
+                                                info!("AUTOSCROLL: Sending overlay Show at ({}, {})", show_x, show_y);
+                                                let _ = sender.send(OverlayCommand::Show(show_x, show_y));
+                                            }
+                                            
+                                            // Reset anchor AFTER KWin query completes to avoid twitch from
+                                            // mouse movement that accumulated during the ~175ms KWin delay
                                             anchor_x = 0;
                                             anchor_y = 0;
                                             cursor_x = 0;
                                             cursor_y = 0;
                                             
-                                            // Show overlay indicator
-                                            if let Some(ref sender) = overlay_sender {
-                                                let _ = sender.send(OverlayCommand::Show);
-                                            }
+                                            // Record activation time - we'll ignore scroll input for a grace period
+                                            // to prevent any residual movement from causing initial twitch
+                                            autoscroll_start_time = Some(Instant::now());
                                             
                                             // Don't pass through the middle button press
                                             continue;
@@ -524,11 +712,13 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                     match axis {
                                         evdev::RelativeAxisType::REL_X => {
                                             cursor_x += ev.value();
+                                            abs_cursor_x = (abs_cursor_x + ev.value()).clamp(0, SCREEN_WIDTH);
                                             autoscroll_moved = true;
                                             // Pass through mouse movement so cursor moves
                                         }
                                         evdev::RelativeAxisType::REL_Y => {
                                             cursor_y += ev.value();
+                                            abs_cursor_y = (abs_cursor_y + ev.value()).clamp(0, SCREEN_HEIGHT);
                                             autoscroll_moved = true;
                                             // Pass through mouse movement so cursor moves
                                         }
@@ -537,8 +727,14 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                     
                                     scroll_tick_counter += 1;
                                     
-                                    // Emit scroll events periodically based on distance from anchor
-                                    if scroll_tick_counter >= SCROLL_TICK_INTERVAL {
+                                    // Check if we should process scroll yet (grace period prevents immediate scrolling)
+                                    let in_grace_period = autoscroll_start_time
+                                        .map(|t| (t.elapsed().as_millis() as u64) < SCROLL_GRACE_PERIOD_MS)
+                                        .unwrap_or(false);
+                                    
+                                    // During grace period, just pass through movement events normally
+                                    // Only start scroll detection after grace period ends
+                                    if !in_grace_period && scroll_tick_counter >= SCROLL_TICK_INTERVAL {
                                         scroll_tick_counter = 0;
                                         
                                         let dx = cursor_x - anchor_x;
@@ -577,7 +773,7 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                                                 let _ = sender.send(OverlayCommand::UpdateDirection(norm_dx, norm_dy));
                                             }
                                         }
-                                    }
+                                    }  // End of if/else block for grace period and scroll_tick check
                                     
                                     // DON'T continue here - let mouse movement pass through
                                 }
@@ -589,8 +785,9 @@ fn run_remapper_loop(stop: Arc<AtomicBool>, ext_config: RemapConfigExt) -> Resul
                             InputEventKind::Key(key) => {
                                 info!("KEY event: code={}, value={}", key.code(), ev.value());
                             }
-                            InputEventKind::RelAxis(axis) => {
-                            info!("REL event: axis={:?}, value={}", axis, ev.value());
+                            InputEventKind::RelAxis(_axis) => {
+                                // Cursor position is tracked at the start of event loop
+                                // Uncomment for debugging: info!("REL event: axis={:?}, value={}", axis, ev.value());
                             }
                             InputEventKind::Synchronization(_) => {
                                 // Don't log sync events (too noisy)

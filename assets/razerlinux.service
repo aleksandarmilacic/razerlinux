@@ -1,17 +1,16 @@
 [Unit]
 Description=RazerLinux Mouse Configuration Tool
 Documentation=https://github.com/aleksandarmilacic/razerlinux
-After=graphical-session.target
+After=graphical-session.target plasma-plasmashell.service
 Wants=graphical-session.target
 
 [Service]
 Type=simple
+# Add startup delay to ensure tray host (StatusNotifierWatcher) is ready
+ExecStartPre=/bin/sleep 3
 ExecStart=/opt/razerlinux/razerlinux-launcher --minimized
 Restart=on-failure
 RestartSec=5
-
-# Environment for GUI applications
-Environment=DISPLAY=:0
 
 [Install]
 WantedBy=graphical-session.target

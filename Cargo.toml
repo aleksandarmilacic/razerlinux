@@ -6,6 +6,12 @@ description = "Razer mouse configuration tool for Linux"
 authors = ["Aleksandar Milacic"]
 license = "GPL-3.0-only"
 
+[features]
+default = ["x11", "wayland", "atspi"]
+x11 = ["dep:x11rb"]
+wayland = ["dep:wayland-client", "dep:wayland-protocols-wlr", "dep:smithay-client-toolkit"]
+atspi = ["dep:atspi", "dep:zbus"]
+
 [dependencies]
 # USB HID communication
 hidapi = "2.6"
@@ -38,8 +44,17 @@ tracing-subscriber = "0.3"
 # GUI - Slint (Qt-like, pure Rust)
 slint = "1"
 
-# X11 for overlay window (autoscroll indicator)
-x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+# X11 for overlay window (autoscroll indicator) - optional
+x11rb = { version = "0.13", features = ["allow-unsafe-code"], optional = true }
+
+# Wayland support - optional
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols-wlr = { version = "0.3", optional = true }
+smithay-client-toolkit = { version = "0.19", optional = true }
+
+# AT-SPI accessibility for scroll detection (works on both X11 and Wayland) - optional
+atspi = { version = "0.22", optional = true }
+zbus = { version = "4", optional = true }
 
 # System tray icon
 tray-icon = "0.19"
