@@ -28,6 +28,8 @@ use std::env;
 use std::rc::Rc;
 #[allow(unused_imports)]
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -36,6 +38,16 @@ slint::include_modules!();
 fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
+
+    // Set up SIGTERM/SIGINT handler for clean shutdown on logout
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_clone = shutdown_flag.clone();
+    ctrlc::set_handler(move || {
+        info!("Received shutdown signal (SIGTERM/SIGINT)");
+        shutdown_flag_clone.store(true, Ordering::SeqCst);
+        // Request Slint to quit the event loop
+        slint::quit_event_loop().ok();
+    }).expect("Error setting signal handler");
 
     // Check if we should run as the tray helper (user-space process for system tray)
     let args: Vec<String> = env::args().collect();

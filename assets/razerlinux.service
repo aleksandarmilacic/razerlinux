@@ -12,5 +12,10 @@ ExecStart=/opt/razerlinux/razerlinux-launcher --minimized
 Restart=on-failure
 RestartSec=5
 
+# Clean shutdown on logout - give time to cleanup
+TimeoutStopSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+
 [Install]
 WantedBy=graphical-session.target

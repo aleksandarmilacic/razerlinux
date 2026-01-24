@@ -116,13 +116,25 @@ cat > "$INSTALL_DIR/razerlinux-launcher" << 'EOF'
 #!/bin/bash
 # RazerLinux launcher with privilege escalation and tray helper
 
-# Cleanup function to stop tray helper when main app exits
+MAIN_PID=""
+TRAY_PID=""
+
+# Cleanup function to stop all child processes
 cleanup() {
-    if [ -n "$TRAY_PID" ]; then
-        kill "$TRAY_PID" 2>/dev/null
+    echo "Launcher: Cleanup triggered"
+    if [ -n "$MAIN_PID" ]; then
+        kill -TERM "$MAIN_PID" 2>/dev/null
+        wait "$MAIN_PID" 2>/dev/null
     fi
+    if [ -n "$TRAY_PID" ]; then
+        kill -TERM "$TRAY_PID" 2>/dev/null
+        wait "$TRAY_PID" 2>/dev/null
+    fi
+    exit 0
 }
-trap cleanup EXIT
+
+# Trap SIGTERM, SIGINT, SIGHUP for clean shutdown
+trap cleanup SIGTERM SIGINT SIGHUP EXIT
 
 # Auto-detect DISPLAY and XAUTHORITY if not set (happens in systemd services)
 if [ -z "$DISPLAY" ]; then
@@ -176,14 +188,18 @@ done
 # Check if udev rules allow non-root access to Razer device
 if [ -n "$RAZER_HIDRAW" ] && [ -r "$RAZER_HIDRAW" ] && [ -w "$RAZER_HIDRAW" ]; then
     # Can access Razer hidraw without root, run directly
-    /opt/razerlinux/razerlinux "$@"
+    /opt/razerlinux/razerlinux "$@" &
+    MAIN_PID=$!
+    wait "$MAIN_PID"
 else
     # Need elevated privileges - pass XDG_RUNTIME_DIR for socket path
     pkexec env \
         DISPLAY="$DISPLAY" \
         XAUTHORITY="$XAUTHORITY" \
         XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-        /opt/razerlinux/razerlinux "$@"
+        /opt/razerlinux/razerlinux "$@" &
+    MAIN_PID=$!
+    wait "$MAIN_PID"
 fi
 EOF
 chmod 755 "$INSTALL_DIR/razerlinux-launcher"
